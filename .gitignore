@@ -1,0 +1,12 @@
+﻿.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# Raporlar ve output; history kalsın:
+reports/DQ_Report.html
+reports/DQ_Report.xlsx
+data/output/
+!reports/history/

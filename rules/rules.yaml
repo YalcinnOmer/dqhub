@@ -1,0 +1,51 @@
+meta:
+  project: "DQ Hub"
+  version: "1.0.0"
+  created_at: "2025-12-12T00:00:00Z"
+
+schema:
+  primary_key: ["id"]
+  allow_extra_columns: true
+  date_formats: ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"]
+
+columns:
+  - name: "id"
+    required: true
+    unique: true
+    type: "string"
+
+  - name: "full_name"
+    required: true
+    type: "string"
+
+  - name: "email"
+    required: true
+    unique: true
+    type: "email"
+    pattern: "^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$"
+
+  - name: "phone"
+    required: true
+    type: "phone"
+    region: "US-CA"
+
+  - name: "birth_date"
+    required: true
+    type: "date"
+    min: "1900-01-01"
+    max: "2025-12-31"
+
+  - name: "created_at"
+    required: true
+    type: "date"
+    min: "2000-01-01"
+    max: "2035-12-31"
+
+global_fixes:
+  trim_all_strings: true
+  collapse_internal_whitespace: true
+  drop_empty_rows: true
+  drop_exact_duplicates: true
+
+reporting:
+  include: ["Summary", "Stats", "Issues", "Fixes_Applied", "Dedupe_Groups"]

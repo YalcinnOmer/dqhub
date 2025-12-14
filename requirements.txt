@@ -1,0 +1,5 @@
+﻿pandas
+faker
+PyYAML
+openpyxl
+typer[all]
