@@ -1,28 +1,24 @@
-﻿.venv/
+﻿# Python / Virtualenv
+.venv/
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+
+# Notebooks
 .ipynb_checkpoints/
 
-# Raporlar ve output; history kalsın:
-reports/DQ_Report.html
-reports/DQ_Report.xlsx
-data/output/
-!reports/history/
-
-.idea/
-
-.venv/
-
-__pycache__/
-
-data/output/
-
-reports/*.xlsx
-
+# Outputs / artifacts
 reports/*.html
+reports/*.json
+reports/*.xlsx
+data/output/
 
-reports/history/
-
-data/synthetic/input.csv
+# OS
+.DS_Store
+Thumbs.db
