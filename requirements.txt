@@ -3,3 +3,4 @@ faker
 PyYAML
 openpyxl
 typer[all]
+plotly==5.24.1
