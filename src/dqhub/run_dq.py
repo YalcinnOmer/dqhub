@@ -1,6 +1,11 @@
+from __future__ import annotations
+
 from pathlib import Path
-import re, yaml
+from datetime import datetime
+import re
+import yaml
 import pandas as pd
+
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "data"
@@ -9,16 +14,23 @@ OUTPUT = DATA / "output"
 REPORTS = ROOT / "reports"
 RULES = ROOT / "rules" / "rules.yaml"
 
+DQ_SUMMARY_CSV = REPORTS / "dq_summary.csv"
+DQ_ISSUES_CSV = REPORTS / "dq_issues.csv"
+
+
 def c_in(df: pd.DataFrame, col: str) -> bool:
     return col in df.columns
 
+
 def collapse_ws(s):
     return re.sub(r"\s+", " ", s.strip()) if isinstance(s, str) else s
+
 
 def email_valid(s: str) -> bool:
     if not isinstance(s, str):
         return False
     return bool(re.match(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", s.strip()))
+
 
 def build_email_from_name(name: str, fallback: str) -> str:
     base = str(name or "").lower().strip()
@@ -29,13 +41,16 @@ def build_email_from_name(name: str, fallback: str) -> str:
         base = fallback
     return f"{base}@example.com"
 
+
 def phone_to_e164_ca(s):
     s = "" if s is pd.NA or s is None else str(s)
     digits = re.sub(r"\D", "", s)[-10:].rjust(10, "0")
     return "+1" + digits
 
+
 def phone_valid_e164_ca(s: str) -> bool:
     return isinstance(s, str) and bool(re.match(r"^\+1\d{10}$", s))
+
 
 def try_parse_date_series(ser: pd.Series, fmts: list[str]) -> pd.Series:
     out = pd.to_datetime(ser, errors="coerce", utc=True)
@@ -45,6 +60,191 @@ def try_parse_date_series(ser: pd.Series, fmts: list[str]) -> pd.Series:
         if cand.notna().sum() >= best.notna().sum():
             best = cand
     return best
+
+
+def _append_csv(df: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = not path.exists()
+    df.to_csv(path, mode="a", index=False, header=header)
+
+
+def _not_empty(df: pd.DataFrame, col: str) -> pd.Series:
+    return ~(df[col].isna() | (df[col].astype(str).str.strip() == ""))
+
+
+def _safe_pct(mask: pd.Series) -> float:
+    if mask is None or len(mask) == 0:
+        return float("nan")
+    return round(float(mask.mean() * 100.0), 2)
+
+
+def _timeliness_mask(df: pd.DataFrame, schema: dict, now_utc: pd.Timestamp) -> tuple[pd.Series | None, dict]:
+    """
+    Timeliness rule: created_at must be within max_age_days and not in the future.
+    Configure in rules.yaml schema:
+      timeliness_max_age_days: 365
+    """
+    if "created_at" not in df.columns:
+        return None, {"applicable": False, "reason": "missing_created_at"}
+
+    max_age_days = schema.get("timeliness_max_age_days", schema.get("max_record_age_days", 365))
+    created = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
+    cutoff = now_utc - pd.Timedelta(days=int(max_age_days))
+    mask = created.notna() & (created >= cutoff) & (created <= now_utc)
+
+    return mask, {"applicable": True, "max_age_days": int(max_age_days), "cutoff": str(cutoff)}
+
+
+def _build_issues(
+    df: pd.DataFrame,
+    cols_cfg: list[dict],
+    schema: dict,
+    date_cols: list[str],
+    date_min: dict,
+    date_max: dict,
+    pk: list[str],
+    now_utc: pd.Timestamp,
+) -> pd.DataFrame:
+    rows: list[dict] = []
+
+    required = {c["name"]: bool(c.get("required", False)) for c in cols_cfg}
+    unique = {c["name"]: bool(c.get("unique", False)) for c in cols_cfg}
+
+    # Completeness: required not empty
+    for col, is_req in required.items():
+        if is_req and col in df.columns:
+            bad = ~_not_empty(df, col)
+            if bad.any():
+                samp = df.loc[bad, col].astype(str).head(5).tolist()
+                rows.append(
+                    {
+                        "dimension": "Completeness",
+                        "rule": f"required_not_empty:{col}",
+                        "column": col,
+                        "failed_count": int(bad.sum()),
+                        "failed_pct": round(100.0 * float(bad.mean()), 2),
+                        "sample_values": str(samp),
+                    }
+                )
+
+    # Validity: email / phone formats
+    if "email" in df.columns:
+        bad = ~df["email"].apply(email_valid)
+        if bad.any():
+            samp = df.loc[bad, "email"].astype(str).head(5).tolist()
+            rows.append(
+                {
+                    "dimension": "Validity",
+                    "rule": "email_format",
+                    "column": "email",
+                    "failed_count": int(bad.sum()),
+                    "failed_pct": round(100.0 * float(bad.mean()), 2),
+                    "sample_values": str(samp),
+                }
+            )
+
+    if "phone" in df.columns:
+        bad = ~df["phone"].apply(phone_valid_e164_ca)
+        if bad.any():
+            samp = df.loc[bad, "phone"].astype(str).head(5).tolist()
+            rows.append(
+                {
+                    "dimension": "Validity",
+                    "rule": "phone_format_e164_ca",
+                    "column": "phone",
+                    "failed_count": int(bad.sum()),
+                    "failed_pct": round(100.0 * float(bad.mean()), 2),
+                    "sample_values": str(samp),
+                }
+            )
+
+    # Validity: date ranges
+    for col in date_cols:
+        ser = pd.to_datetime(df[col], errors="coerce", utc=True)
+        if col in date_min:
+            bad = ser.notna() & (ser < date_min[col])
+            if bad.any():
+                samp = ser.loc[bad].astype(str).head(5).tolist()
+                rows.append(
+                    {
+                        "dimension": "Validity",
+                        "rule": f"date_min:{col}",
+                        "column": col,
+                        "failed_count": int(bad.sum()),
+                        "failed_pct": round(100.0 * float(bad.mean()), 2),
+                        "sample_values": str(samp),
+                    }
+                )
+        if col in date_max:
+            bad = ser.notna() & (ser > date_max[col])
+            if bad.any():
+                samp = ser.loc[bad].astype(str).head(5).tolist()
+                rows.append(
+                    {
+                        "dimension": "Validity",
+                        "rule": f"date_max:{col}",
+                        "column": col,
+                        "failed_count": int(bad.sum()),
+                        "failed_pct": round(100.0 * float(bad.mean()), 2),
+                        "sample_values": str(samp),
+                    }
+                )
+
+    # Uniqueness: PK and unique columns
+    if pk and all(c in df.columns for c in pk):
+        tmp = df.copy()
+        if "created_at" in tmp.columns:
+            tmp["created_at"] = pd.to_datetime(tmp["created_at"], errors="coerce", utc=True)
+            tmp = tmp.sort_values(["created_at"], ascending=False)
+        dup = tmp[pk].duplicated(keep="first")
+        if dup.any():
+            samp = tmp.loc[dup, pk].astype(str).head(5).to_dict(orient="records")
+            rows.append(
+                {
+                    "dimension": "Uniqueness",
+                    "rule": f"primary_key:{'|'.join(pk)}",
+                    "column": "|".join(pk),
+                    "failed_count": int(dup.sum()),
+                    "failed_pct": round(100.0 * float(dup.mean()), 2),
+                    "sample_values": str(samp),
+                }
+            )
+
+    for col, is_uni in unique.items():
+        if is_uni and col in df.columns:
+            dup = df[col].duplicated(keep="first")
+            if dup.any():
+                samp = df.loc[dup, col].astype(str).head(5).tolist()
+                rows.append(
+                    {
+                        "dimension": "Uniqueness",
+                        "rule": f"unique:{col}",
+                        "column": col,
+                        "failed_count": int(dup.sum()),
+                        "failed_pct": round(100.0 * float(dup.mean()), 2),
+                        "sample_values": str(samp),
+                    }
+                )
+
+    # Timeliness
+    tmask, tmeta = _timeliness_mask(df, schema, now_utc)
+    if tmask is not None and tmeta.get("applicable"):
+        bad = ~tmask
+        if bad.any():
+            samp = pd.to_datetime(df["created_at"], errors="coerce", utc=True).loc[bad].astype(str).head(5).tolist()
+            rows.append(
+                {
+                    "dimension": "Timeliness",
+                    "rule": f"created_at_max_age_days:{tmeta.get('max_age_days')}",
+                    "column": "created_at",
+                    "failed_count": int(bad.sum()),
+                    "failed_pct": round(100.0 * float(bad.mean()), 2),
+                    "sample_values": str(samp),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
 
 def run(
     input_path: Path = INPUT,
@@ -72,6 +272,7 @@ def run(
     before = len(df)
     df = df.dropna(how="all")
     drop_empty = before - len(df)
+
     before = len(df)
     df = df.drop_duplicates()
     drop_dupes = before - len(df)
@@ -82,7 +283,9 @@ def run(
             df[c] = pd.NA
 
     if c_in(df, "email"):
-        df["email"] = df["email"].astype(str).str.strip().str.lower().str.replace("_at_", "@", regex=False)
+        df["email"] = (
+            df["email"].astype(str).str.strip().str.lower().str.replace("_at_", "@", regex=False)
+        )
         mask_bad = ~df["email"].apply(email_valid)
         if c_in(df, "full_name"):
             df.loc[mask_bad, "email"] = df.loc[mask_bad, ["full_name", "id"]].apply(
@@ -94,7 +297,7 @@ def run(
     if c_in(df, "phone"):
         df["phone"] = df["phone"].apply(phone_to_e164_ca)
         bad_phone = ~df["phone"].apply(phone_valid_e164_ca)
-        df.loc[bad_phone, "phone"] = "+1" + "0"*10
+        df.loc[bad_phone, "phone"] = "+1" + "0" * 10
 
     if c_in(df, "full_name"):
         df["full_name"] = df["full_name"].fillna("").astype(str).str.strip()
@@ -119,15 +322,22 @@ def run(
 
     col_req = {c["name"]: c.get("required", False) for c in cols_cfg}
     col_unique = {c["name"]: c.get("unique", False) for c in cols_cfg}
-    date_min = {c["name"]: pd.to_datetime(c.get("min"), utc=True) for c in cols_cfg if c.get("type") == "date" and c.get("min")}
-    date_max = {c["name"]: pd.to_datetime(c.get("max"), utc=True) for c in cols_cfg if c.get("type") == "date" and c.get("max")}
+    date_min = {
+        c["name"]: pd.to_datetime(c.get("min"), utc=True)
+        for c in cols_cfg
+        if c.get("type") == "date" and c.get("min")
+    }
+    date_max = {
+        c["name"]: pd.to_datetime(c.get("max"), utc=True)
+        for c in cols_cfg
+        if c.get("type") == "date" and c.get("max")
+    }
 
     m_all = pd.Series(True, index=df.index)
 
     for c in req_cols:
         if col_req.get(c, False):
-            not_empty = ~(df[c].isna() | (df[c].astype(str).str.strip() == ""))
-            m_all &= not_empty
+            m_all &= _not_empty(df, c)
 
     if c_in(df, "email"):
         m_all &= df["email"].apply(email_valid)
@@ -163,6 +373,7 @@ def run(
     if c_in(clean_df, "created_at"):
         clean_df["created_at"] = pd.to_datetime(clean_df["created_at"], errors="coerce", utc=True)
         clean_df["created_at"] = clean_df["created_at"].fillna(pd.Timestamp.now(tz="UTC"))
+
     if c_in(clean_df, "birth_date"):
         clean_df["birth_date"] = pd.to_datetime(clean_df["birth_date"], errors="coerce", utc=True)
         if clean_df["birth_date"].isna().any():
@@ -172,27 +383,118 @@ def run(
             else:
                 clean_df["birth_date"] = clean_df["birth_date"].fillna(pd.Timestamp("2000-01-01", tz="UTC"))
 
-    stats_df = pd.DataFrame([
-        {"column": c,
-         "nulls": int(clean_df[c].isna().sum()),
-         "distinct": int(clean_df[c].nunique(dropna=True)),
-         "pct_null": round(100 * clean_df[c].isna().mean(), 2),
-         "sample": str(clean_df[c].dropna().astype(str).head(3).tolist())}
-        for c in req_cols if c_in(clean_df, c)
-    ])
+    stats_df = pd.DataFrame(
+        [
+            {
+                "column": c,
+                "nulls": int(clean_df[c].isna().sum()),
+                "distinct": int(clean_df[c].nunique(dropna=True)),
+                "pct_null": round(100 * clean_df[c].isna().mean(), 2),
+                "sample": str(clean_df[c].dropna().astype(str).head(3).tolist()),
+            }
+            for c in req_cols
+            if c_in(clean_df, c)
+        ]
+    )
 
-    summary = pd.DataFrame([
-        {"Metric": "Total Rows (raw)", "Value": len(df_raw)},
-        {"Metric": "After Global Fixes", "Value": len(df)},
-        {"Metric": "After Hard Clean", "Value": len(clean_df)},
-        {"Metric": "Rules Version", "Value": rules.get("meta", {}).get("version", "1.0.0")},
-    ])
+    summary = pd.DataFrame(
+        [
+            {"Metric": "Total Rows (raw)", "Value": len(df_raw)},
+            {"Metric": "After Global Fixes", "Value": len(df)},
+            {"Metric": "After Hard Clean", "Value": len(clean_df)},
+            {"Metric": "Rules Version", "Value": rules.get("meta", {}).get("version", "1.0.0")},
+        ]
+    )
 
-    issues_df = pd.DataFrame([])
-    fixes_df = pd.DataFrame([
-        {"rule": "drop_empty_rows", "count": int(drop_empty)},
-        {"rule": "drop_exact_duplicates", "count": int(drop_dupes)}
-    ])
+    now_utc = pd.Timestamp.now(tz="UTC")
+
+    issues_df = _build_issues(
+        df=df,
+        cols_cfg=cols_cfg,
+        schema=schema,
+        date_cols=date_cols,
+        date_min=date_min,
+        date_max=date_max,
+        pk=pk,
+        now_utc=now_utc,
+    )
+
+    fixes_df = pd.DataFrame(
+        [
+            {"rule": "drop_empty_rows", "count": int(drop_empty)},
+            {"rule": "drop_exact_duplicates", "count": int(drop_dupes)},
+        ]
+    )
+
+    # Dimension masks (row-level)
+    m_required = pd.Series(True, index=df.index)
+    for c in req_cols:
+        if col_req.get(c, False) and c_in(df, c):
+            m_required &= _not_empty(df, c)
+
+    validity_checks = 0
+    m_valid = pd.Series(True, index=df.index)
+    if c_in(df, "email"):
+        validity_checks += 1
+        m_valid &= df["email"].apply(email_valid)
+    if c_in(df, "phone"):
+        validity_checks += 1
+        m_valid &= df["phone"].apply(phone_valid_e164_ca)
+    if len(date_cols) > 0:
+        validity_checks += 1
+        for c in date_cols:
+            notna = df[c].notna()
+            if c in date_min:
+                m_valid &= (~notna) | (df[c] >= date_min[c])
+            if c in date_max:
+                m_valid &= (~notna) | (df[c] <= date_max[c])
+
+    uniq_checks = 0
+    m_unique = pd.Series(True, index=df.index)
+    if pk and all(c in df.columns for c in pk):
+        uniq_checks += 1
+        tmp = df.copy()
+        if c_in(tmp, "created_at"):
+            tmp["created_at"] = pd.to_datetime(tmp["created_at"], errors="coerce", utc=True)
+            tmp = tmp.sort_values(["created_at"], ascending=False)
+        keep_idx = ~tmp[pk].duplicated(keep="first")
+        m_unique &= keep_idx.reindex(df.index, fill_value=False)
+
+    for c, is_unique in col_unique.items():
+        if is_unique and c_in(df, c):
+            uniq_checks += 1
+            m_unique &= ~df[c].duplicated(keep="first")
+
+    m_time, _tmeta = _timeliness_mask(df, schema, now_utc)
+
+    run_id = now_utc.strftime("%Y%m%d_%H%M%S")
+
+    dq_summary_row = pd.DataFrame(
+        [
+            {
+                "run_id": run_id,
+                "run_ts_utc": now_utc.isoformat(),
+                "rows_raw": int(len(df_raw)),
+                "rows_after_global_fixes": int(len(df)),
+                "rows_after_hard_clean": int(len(clean_df)),
+                "completeness_pct": _safe_pct(m_required),
+                "validity_pct": _safe_pct(m_valid) if validity_checks > 0 else float("nan"),
+                "uniqueness_pct": _safe_pct(m_unique) if uniq_checks > 0 else float("nan"),
+                "timeliness_pct": _safe_pct(m_time) if m_time is not None else float("nan"),
+                "overall_pct": _safe_pct(m_all),
+                "rules_version": rules.get("meta", {}).get("version", "1.0.0"),
+            }
+        ]
+    )
+
+    issues_out = issues_df.copy()
+    if not issues_out.empty:
+        issues_out.insert(0, "run_id", run_id)
+        issues_out.insert(1, "run_ts_utc", now_utc.isoformat())
+
+    _append_csv(dq_summary_row, DQ_SUMMARY_CSV)
+    if not issues_out.empty:
+        _append_csv(issues_out, DQ_ISSUES_CSV)
 
     clean_csv = out_dir / "clean.csv"
     clean_df.to_csv(clean_csv, index=False)
@@ -205,6 +507,9 @@ def run(
 
     print("Wrote:", report_path, "| exists:", report_path.exists())
     print("Clean CSV:", clean_csv, "| exists:", clean_csv.exists())
+    print("Run History CSV:", DQ_SUMMARY_CSV, "| exists:", DQ_SUMMARY_CSV.exists())
+    print("Issues CSV:", DQ_ISSUES_CSV, "| exists:", DQ_ISSUES_CSV.exists())
+
 
 if __name__ == "__main__":
     run()

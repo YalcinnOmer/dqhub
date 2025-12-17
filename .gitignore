@@ -42,3 +42,7 @@ reports/last_metrics.json
 
 # Keep folders
 !reports/.gitkeep
+# Generated artifacts
+reports/
+data/output/
+

@@ -1,51 +1,148 @@
-meta:
-  project: "DQ Hub"
-  version: "1.0.0"
-  created_at: "2025-12-12T00:00:00Z"
+version: "1.1.0"
 
-schema:
-  primary_key: ["id"]
-  allow_extra_columns: true
-  date_formats: ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"]
+dataset:
+  name: "synthetic_orders"
+  path: "data/output/raw.csv"
+  primary_key: "order_id"
+  timestamps:
+    event_ts: "order_ts_utc"
+    ingest_ts: "ingested_ts_utc"
 
-columns:
-  - name: "id"
-    required: true
-    unique: true
-    type: "string"
+scoring:
+  weights:
+    completeness: 0.30
+    validity: 0.35
+    uniqueness: 0.20
+    timeliness: 0.15
 
-  - name: "full_name"
-    required: true
-    type: "string"
+rules:
+  - id: "uniq_order_id"
+    dimension: "uniqueness"
+    type: "unique"
+    column: "order_id"
+    severity: "high"
 
-  - name: "email"
-    required: true
-    unique: true
-    type: "email"
-    pattern: "^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$"
+  - id: "req_order_ts"
+    dimension: "completeness"
+    type: "not_null"
+    column: "order_ts_utc"
+    severity: "high"
 
-  - name: "phone"
-    required: true
-    type: "phone"
-    region: "US-CA"
+  - id: "req_ingested_ts"
+    dimension: "completeness"
+    type: "not_null"
+    column: "ingested_ts_utc"
+    severity: "high"
 
-  - name: "birth_date"
-    required: true
-    type: "date"
-    min: "1900-01-01"
-    max: "2025-12-31"
+  - id: "req_channel"
+    dimension: "completeness"
+    type: "not_null"
+    column: "channel"
+    severity: "medium"
 
-  - name: "created_at"
-    required: true
-    type: "date"
-    min: "2000-01-01"
-    max: "2035-12-31"
+  - id: "req_country"
+    dimension: "completeness"
+    type: "not_null"
+    column: "country"
+    severity: "medium"
 
-global_fixes:
-  trim_all_strings: true
-  collapse_internal_whitespace: true
-  drop_empty_rows: true
-  drop_exact_duplicates: true
+  - id: "req_email"
+    dimension: "completeness"
+    type: "not_null"
+    column: "email"
+    severity: "medium"
 
-reporting:
-  include: ["Summary", "Stats", "Issues", "Fixes_Applied", "Dedupe_Groups"]
+  - id: "val_channel_set"
+    dimension: "validity"
+    type: "in_set"
+    column: "channel"
+    params:
+      allowed: ["web", "ebay", "amazon"]
+    severity: "high"
+
+  - id: "val_country_set"
+    dimension: "validity"
+    type: "in_set"
+    column: "country"
+    params:
+      allowed: ["CA", "US"]
+    severity: "high"
+
+  - id: "val_currency_set"
+    dimension: "validity"
+    type: "in_set"
+    column: "currency"
+    params:
+      allowed: ["CAD", "USD"]
+    severity: "high"
+
+  - id: "val_email_regex"
+    dimension: "validity"
+    type: "regex"
+    column: "email"
+    params:
+      pattern: "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$"
+    severity: "high"
+
+  - id: "val_postal_regex"
+    dimension: "validity"
+    type: "regex"
+    column: "postal_code"
+    params:
+      pattern: "^(?:[A-Z]\\d[A-Z]\\s?\\d[A-Z]\\d|\\d{5})$"
+      flags: "I"
+    severity: "medium"
+
+  - id: "val_quantity_range"
+    dimension: "validity"
+    type: "range"
+    column: "quantity"
+    params:
+      min: 1
+      max: 50
+    severity: "high"
+
+  - id: "val_unit_price_non_negative"
+    dimension: "validity"
+    type: "range"
+    column: "unit_price"
+    params:
+      min: 0.01
+      max: 10000
+    severity: "high"
+
+  - id: "val_discount_pct_range"
+    dimension: "validity"
+    type: "range"
+    column: "discount_pct"
+    params:
+      min: 0.0
+      max: 0.70
+    severity: "medium"
+
+  - id: "val_order_total_non_negative"
+    dimension: "validity"
+    type: "range"
+    column: "order_total"
+    params:
+      min: 0.0
+      max: 100000
+    severity: "high"
+
+  - id: "time_ingest_lag_hours"
+    dimension: "timeliness"
+    type: "max_lag_hours"
+    params:
+      event_ts: "order_ts_utc"
+      ingest_ts: "ingested_ts_utc"
+      max_hours: 48
+    severity: "medium"
+
+dashboard:
+
+  suggested_slices:
+    - ["channel"]
+    - ["country", "region"]
+    - ["order_status"]
+    - ["shipping_method"]
+  suggested_metrics:
