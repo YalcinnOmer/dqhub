@@ -1,24 +1,39 @@
 ﻿name: dqhub-pipeline
-on: [push, pull_request]
+
+on:
+  push:
+  pull_request:
+
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            pyproject.toml
+
       - name: Install deps
         run: |
-          python -m pip install -U pip
-          pip install -r requirements.txt
-          pip install -e .
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -e .
 
       - name: Run pipeline
         run: |
           dqhub pipeline
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: dqhub-artifacts
           path: |
