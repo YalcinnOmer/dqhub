@@ -7,7 +7,7 @@ try:
 except ImportError:
     raise SystemExit("Missing dependency: faker. Install with: pip install faker")
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 SYNTH_DIR = ROOT / "data" / "synthetic"
 OUT_CSV = SYNTH_DIR / "input.csv"
 ROW_COUNT = 520

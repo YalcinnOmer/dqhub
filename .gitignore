@@ -22,3 +22,23 @@ data/output/
 # OS
 .DS_Store
 Thumbs.db
+
+# IDE
+.idea/
+
+# Build / packaging
+src/dqhub.egg-info/
+
+# Generated data
+data/synthetic/
+data/output/
+src/data/
+
+# Generated reports
+reports/*.xlsx
+reports/*.html
+reports/history/
+reports/last_metrics.json
+
+# Keep folders
+!reports/.gitkeep

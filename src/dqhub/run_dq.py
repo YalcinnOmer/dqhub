@@ -2,7 +2,7 @@ from pathlib import Path
 import re, yaml
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "data"
 INPUT = DATA / "synthetic" / "input.csv"
 OUTPUT = DATA / "output"

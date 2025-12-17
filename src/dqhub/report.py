@@ -6,7 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.io as pio
 
-ROOT    = Path(__file__).resolve().parents[1]
+ROOT    = Path(__file__).resolve().parents[2]
 DATA    = ROOT / "data"
 CLEAN   = DATA / "output" / "clean.csv"
 RULES   = ROOT / "rules" / "rules.yaml"
