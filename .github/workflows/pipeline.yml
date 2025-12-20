@@ -1,9 +1,17 @@
-﻿name: dqhub-pipeline
+name: dqhub-pipeline
 
 on:
   push:
+    branches: ["main"]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dqhub-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -28,6 +36,12 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install -e .
 
+      - name: Ensure output folders exist
+        run: |
+          mkdir -p data/synthetic
+          mkdir -p data/output
+          mkdir -p reports/history
+
       - name: Run pipeline
         run: |
           dqhub pipeline
@@ -37,8 +51,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dqhub-artifacts
+          if-no-files-found: warn
           path: |
             reports/DQ_Report.xlsx
             reports/DQ_Report.html
-            data/output/clean.csv
+            reports/dq_summary.csv
+            reports/dq_issues.csv
+            reports/last_metrics.json
+            reports/last_run.json
             reports/history/
+            data/output/raw.csv
+            data/output/clean.csv
+            data/synthetic/input.csv
