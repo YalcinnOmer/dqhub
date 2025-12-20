@@ -1,295 +1,203 @@
 from __future__ import annotations
 
-import json
-import math
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any
+import json
 
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.utils import PlotlyJSONEncoder
+
 
 ROOT = Path(__file__).resolve().parents[2]
+
 REPORTS_DIR = ROOT / "reports"
-DATA_OUTPUT_DIR = ROOT / "data" / "output"
+OUTPUT_DIR = ROOT / "data" / "output"
 
-DQ_SUMMARY_CSV = REPORTS_DIR / "dq_summary.csv"
-DQ_ISSUES_CSV = REPORTS_DIR / "dq_issues.csv"
-CLEAN_CSV = DATA_OUTPUT_DIR / "clean.csv"
+SUMMARY_CSV = REPORTS_DIR / "dq_summary.csv"
+ISSUES_CSV = REPORTS_DIR / "dq_issues.csv"
+CLEAN_CSV = OUTPUT_DIR / "clean.csv"
 
-OUT_HTML = REPORTS_DIR / "DQ_Report.html"
-OUT_XLSX = REPORTS_DIR / "DQ_Report.xlsx"
-
-THRESH_GOOD = 99.0
-THRESH_WARN = 97.0
+HTML_OUT = REPORTS_DIR / "DQ_Report.html"
+XLSX_OUT = REPORTS_DIR / "DQ_Report.xlsx"
 
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+METRICS = [
+    ("completeness_pct", "Completeness"),
+    ("validity_pct", "Validity"),
+    ("uniqueness_pct", "Uniqueness"),
+    ("timeliness_pct", "Timeliness"),
+    ("overall_pct", "Overall"),
+]
+
+DIMS = [
+    ("completeness_pct", "Completeness"),
+    ("validity_pct", "Validity"),
+    ("uniqueness_pct", "Uniqueness"),
+    ("timeliness_pct", "Timeliness"),
+]
 
 
-def _is_nan(x: Any) -> bool:
-    try:
-        return x is None or (isinstance(x, float) and math.isnan(x))
-    except Exception:
-        return False
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _safe_float(x: Any) -> float | None:
-    if _is_nan(x):
-        return None
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-
-def _safe_int(x: Any) -> int | None:
-    if _is_nan(x):
-        return None
-    try:
-        return int(float(x))
-    except Exception:
-        return None
-
-
-def _pct_str(x: Any) -> str:
-    v = _safe_float(x)
-    return "N/A" if v is None else f"{v:.2f}%"
-
-
-def _level(score: float | None) -> str:
-    if score is None:
-        return "unknown"
-    if score >= THRESH_GOOD:
-        return "good"
-    if score >= THRESH_WARN:
-        return "warn"
-    return "crit"
-
-
-def _read_csv(path: Path) -> pd.DataFrame | None:
-    if not path.exists():
-        return None
-    try:
-        return pd.read_csv(path)
-    except Exception:
-        return None
-
-
-@dataclass(frozen=True)
-class RunRow:
-    run_id: str
-    run_label: str
-    rows_raw: int | None
-    completeness_pct: float | None
-    validity_pct: float | None
-    uniqueness_pct: float | None
-    timeliness_pct: float | None
-    overall_pct: float | None
-    rules_version: str | None
-
-
-def _build_runs(hist: pd.DataFrame) -> list[RunRow]:
-    h = hist.reset_index(drop=True).copy()
-    runs: list[RunRow] = []
-    for i in range(len(h)):
-        d = h.iloc[i].to_dict()
-        runs.append(
-            RunRow(
-                run_id=str(d.get("run_id") or f"run_{i+1}"),
-                run_label=f"Run {i+1}",
-                rows_raw=_safe_int(d.get("rows_raw")),
-                completeness_pct=_safe_float(d.get("completeness_pct")),
-                validity_pct=_safe_float(d.get("validity_pct")),
-                uniqueness_pct=_safe_float(d.get("uniqueness_pct")),
-                timeliness_pct=_safe_float(d.get("timeliness_pct")),
-                overall_pct=_safe_float(d.get("overall_pct")),
-                rules_version=str(d.get("rules_version") or "").strip() or None,
-            )
-        )
-    return runs
-
-
-def _score_bar(run: RunRow) -> go.Figure:
-    labels = ["Completeness", "Validity", "Uniqueness", "Timeliness", "Overall"]
-    values = [run.completeness_pct, run.validity_pct, run.uniqueness_pct, run.timeliness_pct, run.overall_pct]
-
-    y: list[float] = []
-    text: list[str] = []
-    colors: list[str] = []
-
-    for v in values:
-        if v is None:
-            y.append(0.0)
-            text.append("")
-            colors.append("#9ca3af")
-        else:
-            y.append(float(v))
-            text.append(f"{float(v):.2f}%")
-            lvl = _level(float(v))
-            colors.append("#16a34a" if lvl == "good" else "#f59e0b" if lvl == "warn" else "#dc2626")
-
-    fig = go.Figure()
-    fig.add_trace(
-        go.Bar(
-            x=labels,
-            y=y,
-            marker=dict(color=colors),
-            text=text,
-            textposition="inside",
-            hovertemplate="Metric: %{x}<br>Score: %{y:.2f}%<extra></extra>",
-        )
-    )
-    fig.update_layout(
-        template="plotly_white",
-        height=320,
-        margin=dict(l=40, r=20, t=10, b=40),
-        showlegend=False,
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-        font=dict(size=12),
-    )
-    fig.update_yaxes(title_text="%", range=[0, 100])
-    return fig
-
-
-def _trend(runs: list[RunRow]) -> go.Figure | None:
-    if len(runs) < 2:
-        return None
-
-    x = [r.run_label for r in runs]
-
-    def series(attr: str) -> list[float | None]:
-        return [getattr(r, attr) for r in runs]
-
-    fig = go.Figure()
-    for name, attr, default_visible in [
-        ("Overall", "overall_pct", True),
-        ("Completeness", "completeness_pct", False),
-        ("Validity", "validity_pct", False),
-        ("Uniqueness", "uniqueness_pct", False),
-        ("Timeliness", "timeliness_pct", False),
-    ]:
-        fig.add_trace(
-            go.Scatter(
-                x=x,
-                y=series(attr),
-                mode="lines+markers",
-                name=name,
-                visible=True if default_visible else "legendonly",
-                hovertemplate=f"{name}: %{{y:.2f}}%<br>Run: %{{x}}<extra></extra>",
-            )
-        )
-
-    fig.update_layout(
-        template="plotly_white",
-        height=320,
-        margin=dict(l=40, r=20, t=40, b=45),
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-        font=dict(size=12),
-        showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0, font=dict(size=11)),
-    )
-    fig.update_yaxes(title_text="%", range=[90, 100], automargin=True)
-    fig.update_xaxes(type="category", automargin=True)
-    return fig
-
-
-def _write_xlsx(hist: pd.DataFrame, issues: pd.DataFrame | None) -> None:
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(OUT_XLSX, engine="openpyxl") as xw:
-        hist.to_excel(xw, sheet_name="dq_summary", index=False)
-        if issues is not None:
-            issues.to_excel(xw, sheet_name="dq_issues", index=False)
-
-
-def main() -> None:
+def _ensure_report_dirs() -> None:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    hist = _read_csv(DQ_SUMMARY_CSV)
-    if hist is None or hist.empty:
-        raise FileNotFoundError(f"Missing or empty: {DQ_SUMMARY_CSV}")
 
-    runs = _build_runs(hist)
-    current = runs[-1]
+def _read_summary() -> pd.DataFrame:
+    if not SUMMARY_CSV.exists():
+        raise FileNotFoundError(f"Missing {SUMMARY_CSV}. Run `dqhub clean` first.")
+    df = pd.read_csv(SUMMARY_CSV)
+    if df.empty:
+        raise ValueError("dq_summary.csv is empty.")
+    if "run_label" not in df.columns:
+        df.insert(0, "run_label", [f"Run {i+1}" for i in range(len(df))])
+    return df
 
-    issues = _read_csv(DQ_ISSUES_CSV)
 
-    # Excel export (best-effort)
+def _read_issues() -> pd.DataFrame:
+    if not ISSUES_CSV.exists():
+        return pd.DataFrame(
+            columns=["run_label", "run_id", "dimension", "rule", "column", "failed_count", "failed_pct", "sample_values"]
+        )
+    df = pd.read_csv(ISSUES_CSV)
+    if "run_label" not in df.columns:
+        df["run_label"] = ""
+    if "run_id" not in df.columns:
+        df["run_id"] = ""
+    return df
+
+
+def _dataset_line() -> str:
+    if not CLEAN_CSV.exists():
+        return "Dataset not loaded."
     try:
-        _write_xlsx(hist, issues)
-        print(f"Wrote: {OUT_XLSX} | exists: {OUT_XLSX.exists()}")
+        df = pd.read_csv(CLEAN_CSV)
+        r, c = df.shape
+        return f"Dataset loaded: clean.csv ({r} rows, {c} columns)."
     except Exception:
-        pass
+        return "Dataset loaded: clean.csv."
 
-    score_fig = _score_bar(current)
-    trend_fig = _trend(runs)
 
-    score_json = json.dumps(score_fig.to_dict(), cls=PlotlyJSONEncoder)
-    trend_json = "null" if trend_fig is None else json.dumps(trend_fig.to_dict(), cls=PlotlyJSONEncoder)
+def _to_records(df: pd.DataFrame) -> list[dict[str, Any]]:
+    # Convert NaN to None for clean JSON
+    out: list[dict[str, Any]] = []
+    for row in df.to_dict(orient="records"):
+        clean = {}
+        for k, v in row.items():
+            if pd.isna(v):
+                clean[k] = None
+            else:
+                clean[k] = v
+        out.append(clean)
+    return out
 
-    runs_json = json.dumps([r.__dict__ for r in runs], cls=PlotlyJSONEncoder)
 
-    issues_json = "null"
-    if issues is not None and not issues.empty:
-        issues_json = json.dumps(issues.to_dict(orient="records"), cls=PlotlyJSONEncoder)
+def _write_excel(summary: pd.DataFrame, issues: pd.DataFrame) -> None:
+    with pd.ExcelWriter(XLSX_OUT, engine="openpyxl") as writer:
+        summary.to_excel(writer, index=False, sheet_name="Summary")
+        issues.to_excel(writer, index=False, sheet_name="Issues")
 
-    html = f"""<!doctype html>
+        wb = writer.book
+        for ws_name in ["Summary", "Issues"]:
+            ws = wb[ws_name]
+            ws.freeze_panes = "A2"
+            # basic width autosize
+            for col in ws.columns:
+                col_letter = col[0].column_letter
+                max_len = 10
+                for cell in col[:200]:
+                    if cell.value is None:
+                        continue
+                    max_len = max(max_len, len(str(cell.value)))
+                ws.column_dimensions[col_letter].width = min(max_len + 2, 45)
+
+
+def _build_html(summary_records: list[dict[str, Any]], issues_records: list[dict[str, Any]]) -> str:
+    generated = _now_utc_iso()
+    dataset_line = _dataset_line()
+
+    # Keep file names relative (works when opening reports/DQ_Report.html locally)
+    xlsx_name = XLSX_OUT.name
+    summary_name = SUMMARY_CSV.name
+    issues_name = ISSUES_CSV.name
+
+    return f"""<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>Data Quality Dashboard</title>
-  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
   <style>
     :root {{
-      --text:#111827; --muted:#6b7280; --border:#e5e7eb; --card:#ffffff; --bg:#f8fafc;
-      --good:#16a34a; --warn:#f59e0b; --crit:#dc2626; --shadow: 0 1px 2px rgba(0,0,0,.04);
+      --bg: #f6f7fb; --panel: #ffffff; --text: #111827; --muted: #6b7280; --border: #e5e7eb;
+      --shadow: 0 1px 2px rgba(0,0,0,0.05); --good: #16a34a; --chip: #eef2ff;
     }}
-    [data-theme="dark"] {{
-      --text:#e5e7eb; --muted:#9ca3af; --border:#1f2937; --card:#0b1220; --bg:#060b16;
-      --shadow: 0 1px 2px rgba(0,0,0,.35);
+    html.dark {{
+      --bg: #0b1220; --panel: #0f172a; --text: #e5e7eb; --muted: #9ca3af; --border: #1f2937;
+      --shadow: 0 1px 2px rgba(0,0,0,0.35); --good: #22c55e; --chip: rgba(99,102,241,0.12);
     }}
-    body {{ margin:0; background:var(--bg); color:var(--text);
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; }}
-    .container {{ max-width: 1280px; margin: 26px auto; padding: 0 18px 40px; }}
-    header {{ display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin-bottom: 14px; }}
-    h1 {{ margin:0; font-size: 30px; letter-spacing: -0.02em; }}
-    .sub {{ color: var(--muted); font-size: 12.5px; margin-top: 6px; }}
-    .toolbar {{ display:flex; gap:10px; align-items:center; justify-content:flex-end; flex-wrap: wrap; }}
-    .pill {{ border:1px solid var(--border); background:var(--card); border-radius:999px; padding:7px 10px;
-      font-size:12px; color:var(--muted); box-shadow: var(--shadow); display:flex; gap:8px; align-items:center; }}
-    select, button {{ border:1px solid var(--border); background:var(--card); color:var(--text);
-      border-radius:10px; padding:8px 10px; font-size:12px; cursor:pointer; box-shadow: var(--shadow); }}
-    .kpi-grid {{ display:grid; grid-template-columns: 1fr; gap: 12px; margin: 14px 0 18px; }}
-    @media (min-width: 900px) {{ .kpi-grid {{ grid-template-columns: repeat(4, 1fr); }} }}
-    .kpi {{ border:1px solid var(--border); border-radius: 14px; background: var(--card);
-      padding: 12px; box-shadow: var(--shadow); min-height: 90px; position: relative; }}
-    .kpi-label {{ color: var(--muted); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }}
-    .kpi-value {{ font-size: 20px; font-weight: 800; margin-top: 8px; }}
-    .kpi-sub {{ color: var(--muted); font-size: 12px; margin-top: 6px; line-height: 1.35; }}
-    .badge {{ position:absolute; top:10px; right:10px; font-size:11px; font-weight:800; padding:4px 8px;
-      border-radius:999px; border:1px solid var(--border); }}
-    .badge.good {{ color: var(--good); }}
-    .badge.warn {{ color: var(--warn); }}
-    .badge.crit {{ color: var(--crit); }}
-    .grid {{ display:grid; grid-template-columns: 1fr; gap: 14px; align-items: start; }}
-    @media (min-width: 1050px) {{ .grid {{ grid-template-columns: 1fr 1fr; }} }}
-    .card {{ border:1px solid var(--border); border-radius: 14px; background: var(--card);
-      padding: 12px; box-shadow: var(--shadow); }}
-    .card h2 {{ margin: 2px 0 10px; font-size: 14px; font-weight: 900; letter-spacing: -0.01em;
-      display:flex; align-items:center; justify-content:space-between; gap: 10px; }}
-    .muted {{ color: var(--muted); font-size: 12.5px; line-height: 1.45; }}
-    .table-wrap {{ overflow:auto; border: 1px solid var(--border); border-radius: 10px; }}
-    table {{ width:100%; border-collapse: collapse; font-size: 12px; min-width: 900px; }}
-    thead th {{ text-align:left; padding: 10px 10px; background: rgba(249,250,251,.8);
-      border-bottom: 1px solid var(--border); color: var(--muted); font-weight: 900; white-space: nowrap; }}
-    [data-theme="dark"] thead th {{ background: rgba(17,24,39,.55); }}
-    tbody td {{ padding: 10px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; color: var(--text); }}
+    body {{
+      margin: 0; background: var(--bg); color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    }}
+    .container {{ max-width: 1120px; margin: 28px auto 60px; padding: 0 18px; }}
+    header {{ display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:14px; }}
+    h1 {{ margin:0; font-size:28px; letter-spacing:-0.02em; }}
+    .sub {{ margin-top:6px; color:var(--muted); font-size:13px; line-height:1.4; }}
+    .toolbar {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }}
+    .btn, select {{
+      border: 1px solid var(--border); background: var(--panel); color: var(--text);
+      padding: 8px 10px; border-radius: 999px; font-size: 12px; box-shadow: var(--shadow); cursor: pointer;
+      text-decoration: none;
+    }}
+    select {{ cursor:pointer; padding-right:28px; }}
+    .cards {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-top:16px; }}
+    @media (max-width: 980px) {{ .cards {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} }}
+    @media (max-width: 520px) {{
+      .cards {{ grid-template-columns:1fr; }}
+      header {{ flex-direction:column; align-items:stretch; }}
+      .toolbar {{ justify-content:flex-start; }}
+    }}
+    .card {{
+      background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+      padding: 14px; box-shadow: var(--shadow);
+    }}
+    .card .label {{
+      font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;
+      display:flex; align-items:center; justify-content:space-between; gap:10px;
+    }}
+    .chip {{
+      font-size: 11px; padding: 3px 8px; border-radius: 999px; background: var(--chip);
+      border: 1px solid var(--border); color: var(--good); font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+    }}
+    .value {{ font-size: 20px; font-weight: 800; margin-top: 6px; }}
+    .meta {{ font-size: 12px; color: var(--muted); margin-top: 4px; }}
+    .grid2 {{ display:grid; grid-template-columns:1.2fr 1fr; gap:12px; margin-top:12px; align-items:stretch; }}
+    @media (max-width: 980px) {{ .grid2 {{ grid-template-columns:1fr; }} }}
+    .panel {{
+      background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; box-shadow: var(--shadow);
+    }}
+    .panel-header {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:6px; }}
+    .panel-title {{ font-weight:800; font-size:13px; }}
+    .panel-note {{ font-size:12px; color: var(--muted); }}
+    .checks {{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; color:var(--muted); font-size:12px; margin-bottom:6px; }}
+    .checks label {{ display:inline-flex; align-items:center; gap:6px; cursor:pointer; user-select:none; }}
+    .section {{ margin-top: 14px; }}
+    table {{
+      width:100%; border-collapse:collapse; font-size:12px; overflow:hidden;
+      border-radius:10px; border:1px solid var(--border);
+    }}
+    th, td {{ padding:10px; border-bottom:1px solid var(--border); vertical-align:top; }}
+    th {{
+      text-align:left; background: rgba(148,163,184,0.08); color: var(--muted);
+      font-weight:700; font-size:11px; text-transform:lowercase;
+    }}
+    tr:last-child td {{ border-bottom:none; }}
+    .right {{ text-align:right; }}
+    .hint {{ font-size:12px; color: var(--muted); margin-top:6px; }}
   </style>
 </head>
 <body>
@@ -297,237 +205,402 @@ def main() -> None:
     <header>
       <div>
         <h1>Data Quality Dashboard</h1>
-        <div class="sub">Interactive dashboard generated from dq_summary and dq_issues.</div>
+        <div class="sub">
+          Click a metric bar to open drill-down details. Toggle trend dimensions using filters or legend.<br/>
+          <span style="opacity:0.85">Generated: {generated}</span>
+        </div>
       </div>
       <div class="toolbar">
-        <div class="pill">
-          <span>Run</span>
-          <select id="runSelect"></select>
-        </div>
-        <button id="themeToggle" type="button">Toggle Dark Mode</button>
-        <div class="pill">
-          <span>Export</span>
-          <a href="{OUT_XLSX.name}" download style="text-decoration:none;"><button type="button">Excel</button></a>
-          <button id="btnPrint" type="button">Print (PDF)</button>
-        </div>
+        <button class="btn" id="btnRun">Run</button>
+        <select id="runSelect" aria-label="Select run"></select>
+        <button class="btn" id="btnDark">Toggle Dark Mode</button>
       </div>
     </header>
 
-    <div class="kpi-grid">
-      <div class="kpi">
-        <div class="kpi-label">Overall DQ</div>
-        <div id="kpiOverall" class="kpi-value">{_pct_str(current.overall_pct)}</div>
-        <div id="kpiRules" class="kpi-sub">Rules: {current.rules_version or "—"}</div>
-        <div id="kpiBadge" class="badge {_level(current.overall_pct)}">{_level(current.overall_pct).upper()}</div>
-      </div>
-      <div class="kpi">
-        <div class="kpi-label">Rows (raw)</div>
-        <div id="kpiRows" class="kpi-value">{current.rows_raw if current.rows_raw is not None else "N/A"}</div>
-        <div class="kpi-sub">Source: data/synthetic/input.csv</div>
-      </div>
-      <div class="kpi">
-        <div class="kpi-label">Report</div>
-        <div class="kpi-value">HTML + XLSX</div>
-        <div class="kpi-sub">{_utc_now().strftime("%Y-%m-%d %H:%M UTC")}</div>
-      </div>
-      <div class="kpi">
-        <div class="kpi-label">Issues</div>
-        <div id="kpiIssues" class="kpi-value">—</div>
-        <div class="kpi-sub">From dq_issues.csv</div>
-      </div>
+    <div class="toolbar" style="justify-content:flex-end; margin-top: 8px;">
+      <button class="btn" id="btnExport">Export</button>
+      <button class="btn" id="btnPrint">Print (PDF)</button>
+      <button class="btn" id="btnPng">Chart PNG</button>
+      <a class="btn" href="{xlsx_name}" download>Excel</a>
+      <a class="btn" href="{summary_name}" download>dq_summary.csv</a>
+      <a class="btn" href="{issues_name}" download>dq_issues.csv</a>
     </div>
 
-    <div class="grid">
+    <div class="cards">
       <div class="card">
-        <h2><span>Current DQ Score</span><span class="muted">Hover for details</span></h2>
-        <div id="scoreChart"></div>
+        <div class="label"><span>Overall DQ</span><span class="chip" id="chipStatus">GOOD</span></div>
+        <div class="value" id="overallValue">N/A</div>
+        <div class="meta" id="overallDelta">Δ vs previous: N/A</div>
       </div>
+
       <div class="card">
-        <h2><span>Trend</span><span class="muted">Legend toggles</span></h2>
-        <div id="trendChart"></div>
+        <div class="label"><span>Lowest Dimension</span></div>
+        <div class="value" id="lowestValue">N/A</div>
+        <div class="meta">All metrics available.</div>
+      </div>
+
+      <div class="card">
+        <div class="label"><span>Rows (Raw)</span></div>
+        <div class="value" id="rowsValue">0</div>
+        <div class="meta" id="rulesMeta">Rules: N/A</div>
+      </div>
+
+      <div class="card">
+        <div class="label"><span>Issues (Current Run)</span></div>
+        <div class="value" id="issuesValue">0</div>
+        <div class="meta" id="issuesMeta">No issues detected.</div>
       </div>
     </div>
 
-    <div style="height:14px"></div>
+    <div class="grid2">
+      <div class="panel">
+        <div class="panel-header"><div class="panel-title">Current DQ Score</div><div class="panel-note">Click bars for details</div></div>
+        <div id="barChart" style="height:320px;"></div>
+      </div>
 
-    <div class="card">
-      <h2><span>Issue Details (Current Run)</span><span class="muted" id="issueMeta"></span></h2>
-      <div class="table-wrap">
-        <table id="issuesTable"></table>
+      <div class="panel">
+        <div class="panel-header">
+          <div><div class="panel-title">Trend</div><div class="checks" id="trendChecks"></div></div>
+          <div class="panel-note" id="trendMode">Default: Overall</div>
+        </div>
+        <div id="trendChart" style="height:320px;"></div>
+        <div class="hint" id="historyHint"></div>
       </div>
     </div>
 
-    <div style="height:14px"></div>
-
-    <div class="card">
-      <h2><span>Run History</span><span class="muted">dq_summary.csv</span></h2>
-      <div class="table-wrap">
-        <table id="histTable"></table>
+    <div class="section panel">
+      <div class="panel-header">
+        <div><div class="panel-title">Metric Details (Drill-down)</div><div class="panel-note">Overall is an aggregate score. Use dimension drill-down to identify root causes.</div></div>
+        <div class="panel-note" id="drillTitle">Overall -</div>
       </div>
+      <div class="panel-note" style="margin-bottom: 8px;">{dataset_line}</div>
+      <div id="drillTableWrap"></div>
+    </div>
+
+    <div class="section panel">
+      <div class="panel-header"><div class="panel-title">Run History</div><div class="panel-note">Run labels only (no timestamps)</div></div>
+      <div id="historyTableWrap"></div>
     </div>
   </div>
 
 <script>
-  const SCORE_FIG = {score_json};
-  const TREND_FIG = {trend_json};
-  const RUNS = {runs_json};
-  const ISSUES = {issues_json};
+  const SUMMARY = {json.dumps(summary_records, ensure_ascii=False)};
+  const ISSUES  = {json.dumps(issues_records, ensure_ascii=False)};
+  const METRICS = {json.dumps([{"key": k, "label": lbl} for k, lbl in METRICS], ensure_ascii=False)};
+  const DIMS    = {json.dumps([{"key": k, "label": lbl} for k, lbl in DIMS], ensure_ascii=False)};
 
-  const cfg = {{ displaylogo:false, responsive:true, displayModeBar:false }};
+  const els = {{
+    runSelect: document.getElementById("runSelect"),
+    btnDark: document.getElementById("btnDark"),
+    btnPrint: document.getElementById("btnPrint"),
+    btnPng: document.getElementById("btnPng"),
+    btnExport: document.getElementById("btnExport"),
+    btnRun: document.getElementById("btnRun"),
+    overallValue: document.getElementById("overallValue"),
+    overallDelta: document.getElementById("overallDelta"),
+    chipStatus: document.getElementById("chipStatus"),
+    lowestValue: document.getElementById("lowestValue"),
+    rowsValue: document.getElementById("rowsValue"),
+    rulesMeta: document.getElementById("rulesMeta"),
+    issuesValue: document.getElementById("issuesValue"),
+    issuesMeta: document.getElementById("issuesMeta"),
+    trendChecks: document.getElementById("trendChecks"),
+    historyHint: document.getElementById("historyHint"),
+    drillTitle: document.getElementById("drillTitle"),
+    drillTableWrap: document.getElementById("drillTableWrap"),
+    historyTableWrap: document.getElementById("historyTableWrap"),
+  }};
 
-  function setTheme(theme) {{
-    document.documentElement.setAttribute("data-theme", theme);
-    localStorage.setItem("dq_theme", theme);
+  function fmtPct(v) {{
+    if (v === null || v === undefined || Number.isNaN(Number(v))) return "N/A";
+    return Number(v).toFixed(2) + "%";
   }}
-
-  function initTheme() {{
-    const saved = localStorage.getItem("dq_theme");
-    if (saved === "dark" || saved === "light") setTheme(saved);
-    else setTheme("light");
+  function safeNum(v, fallback=0) {{
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
   }}
-
-  function pct(x) {{
-    if (x === null || x === undefined || Number.isNaN(x)) return "N/A";
-    return `${{Number(x).toFixed(2)}}%`;
+  function getRunLabels() {{ return SUMMARY.map(r => String(r.run_label)); }}
+  function getRunRow(label) {{ return SUMMARY.find(r => String(r.run_label) === String(label)); }}
+  function getPrevLabel(label) {{
+    const labels = getRunLabels();
+    const idx = labels.indexOf(String(label));
+    if (idx <= 0) return null;
+    return labels[idx - 1];
   }}
-
-  function renderRunSelect() {{
-    const sel = document.getElementById("runSelect");
-    sel.innerHTML = "";
-    RUNS.forEach((r, idx) => {{
-      const opt = document.createElement("option");
-      opt.value = r.run_id;
-      opt.textContent = r.run_label + (idx === RUNS.length - 1 ? " (latest)" : "");
-      sel.appendChild(opt);
+  function deltaPP(metricKey, label) {{
+    const prev = getPrevLabel(label);
+    if (!prev) return null;
+    const curRow = getRunRow(label);
+    const prevRow = getRunRow(prev);
+    if (!curRow || !prevRow) return null;
+    const cur = safeNum(curRow[metricKey], NaN);
+    const prv = safeNum(prevRow[metricKey], NaN);
+    if (!Number.isFinite(cur) || !Number.isFinite(prv)) return null;
+    return cur - prv;
+  }}
+  function lowestDimension(row) {{
+    let best = {{ label: "N/A", val: null }};
+    DIMS.forEach(d => {{
+      const v = safeNum(row[d.key], NaN);
+      if (!Number.isFinite(v)) return;
+      if (best.val === null || v < best.val) best = {{ label: d.label, val: v }};
     }});
-    sel.value = RUNS[RUNS.length - 1].run_id;
+    return best;
+  }}
+  function issuesForRun(label) {{
+    const runIssues = ISSUES.filter(x => String(x.run_label || "") === String(label));
+    return runIssues.filter(x => safeNum(x.failed_count, 0) > 0);
+  }}
+  function buildRunSelect() {{
+    els.runSelect.innerHTML = "";
+    const labels = getRunLabels();
+    labels.forEach((lbl, i) => {{
+      const opt = document.createElement("option");
+      opt.value = lbl;
+      const isLatest = i === labels.length - 1;
+      opt.textContent = isLatest ? `${{lbl}} (latest)` : lbl;
+      els.runSelect.appendChild(opt);
+    }});
+    els.runSelect.value = labels[labels.length - 1];
+  }}
+  function statusChip(overallPct) {{
+    if (overallPct >= 95) return {{ text: "GOOD", color: "var(--good)" }};
+    if (overallPct >= 85) return {{ text: "OK", color: "#f59e0b" }};
+    return {{ text: "RISK", color: "#ef4444" }};
+  }}
+  function htmlEscape(s) {{
+    return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+      .replaceAll('"',"&quot;").replaceAll("'","&#039;");
+  }}
+
+  let activeMetric = "overall_pct";
+
+  function renderCards(label) {{
+    const row = getRunRow(label);
+    const overall = safeNum(row.overall_pct, 0);
+    els.overallValue.textContent = fmtPct(overall);
+
+    const d = deltaPP("overall_pct", label);
+    els.overallDelta.textContent = "Δ vs previous: " + (d === null ? "N/A" : (d >= 0 ? "+" : "") + d.toFixed(2) + " pp");
+
+    const st = statusChip(overall);
+    els.chipStatus.textContent = st.text;
+    els.chipStatus.style.color = st.color;
+
+    const low = lowestDimension(row);
+    els.lowestValue.textContent = `${{low.label}} (${{fmtPct(low.val)}})`;
+
+    els.rowsValue.textContent = String(row.rows_raw ?? "");
+    els.rulesMeta.textContent = "Rules: " + String(row.rules_version ?? "N/A");
+
+    const curIssues = issuesForRun(label);
+    els.issuesValue.textContent = String(curIssues.length);
+    els.issuesMeta.textContent = curIssues.length === 0 ? "No issues detected." : "See drill-down for details.";
+  }}
+
+  function renderBar(label) {{
+    const row = getRunRow(label);
+    const x = METRICS.map(m => m.label);
+    const y = METRICS.map(m => safeNum(row[m.key], 0));
+
+    Plotly.newPlot("barChart",
+      [{{ type:"bar", x, y, hovertemplate:"Metric: %{{x}}<br>Score: %{{y:.2f}}%<extra></extra>" }}],
+      {{
+        margin: {{ l:45, r:15, t:10, b:45 }},
+        yaxis: {{ range:[0,100], ticksuffix:"%", gridcolor:"rgba(148,163,184,0.25)" }},
+        paper_bgcolor:"rgba(0,0,0,0)", plot_bgcolor:"rgba(0,0,0,0)",
+        font: {{ color: getComputedStyle(document.documentElement).getPropertyValue("--text").trim() }},
+      }},
+      {{ displayModeBar:false, responsive:true }}
+    );
+
+    document.getElementById("barChart").on("plotly_click", (ev) => {{
+      const metricLabel = ev.points?.[0]?.x;
+      const metric = METRICS.find(m => m.label === metricLabel);
+      if (!metric) return;
+      activeMetric = metric.key;
+      renderDrill(label, activeMetric);
+    }});
+  }}
+
+  function renderTrendChecks() {{
+    els.trendChecks.innerHTML = "";
+    const make = (key, label, checked=true) => {{
+      const id = "chk_" + key;
+      const wrap = document.createElement("label");
+      wrap.innerHTML = `<input type="checkbox" id="${{id}}" ${{checked ? "checked" : ""}} /> <span>${{label}}</span>`;
+      els.trendChecks.appendChild(wrap);
+      wrap.querySelector("input").addEventListener("change", () => renderTrend(els.runSelect.value));
+    }};
+    make("overall_pct", "Overall", true);
+    make("completeness_pct", "Completeness", true);
+    make("validity_pct", "Validity", true);
+    make("uniqueness_pct", "Uniqueness", true);
+    make("timeliness_pct", "Timeliness", true);
+  }}
+  function isChecked(key) {{
+    const el = document.getElementById("chk_" + key);
+    return el ? el.checked : false;
+  }}
+  function renderTrend(label) {{
+    const labels = getRunLabels();
+    const traces = [];
+    const add = (key, name) => {{
+      if (!isChecked(key)) return;
+      traces.push({{
+        type:"scatter", mode:"lines+markers", name,
+        x: labels,
+        y: SUMMARY.map(r => safeNum(r[key], NaN)),
+        hovertemplate: `${{name}}: %{{y:.2f}}%<extra></extra>`
+      }});
+    }};
+    add("overall_pct","Overall");
+    add("completeness_pct","Completeness");
+    add("validity_pct","Validity");
+    add("uniqueness_pct","Uniqueness");
+    add("timeliness_pct","Timeliness");
+
+    Plotly.newPlot("trendChart", traces,
+      {{
+        margin: {{ l:45, r:15, t:10, b:45 }},
+        yaxis: {{ range:[0,100], ticksuffix:"%", gridcolor:"rgba(148,163,184,0.25)" }},
+        paper_bgcolor:"rgba(0,0,0,0)", plot_bgcolor:"rgba(0,0,0,0)",
+        font: {{ color: getComputedStyle(document.documentElement).getPropertyValue("--text").trim() }},
+        legend: {{ orientation:"h", y: 1.15 }},
+      }},
+      {{ displayModeBar:false, responsive:true }}
+    );
+    els.historyHint.textContent = `Limited history: ${{labels.length}} runs.`;
   }}
 
   function renderHistoryTable() {{
-    const t = document.getElementById("histTable");
-    const cols = ["run_label","rows_raw","overall_pct","completeness_pct","validity_pct","uniqueness_pct","timeliness_pct","rules_version"];
-    const thead = `<thead><tr>${{cols.map(c => `<th>${{c}}</th>`).join("")}}</tr></thead>`;
-    const tbody = `<tbody>${{RUNS.map(r => {{
-      return `<tr>${{cols.map(c => {{
+    const cols = ["run_label","rows_raw","overall_pct","completeness_pct","validity_pct","uniqueness_pct","timeliness_pct"];
+    const header = cols.map(c => `<th>${{htmlEscape(c)}}</th>`).join("");
+    const rows = SUMMARY.map(r => {{
+      const tds = cols.map(c => {{
         const v = r[c];
-        if (c.endsWith("_pct")) return `<td>${{pct(v)}}</td>`;
-        return `<td>${{(v===null||v===undefined) ? "—" : v}}</td>`;
-      }}).join("")}}</tr>`;
-    }}).join("")}}</tbody>`;
-    t.innerHTML = thead + tbody;
+        if (String(c).endsWith("_pct")) return `<td class="right">${{fmtPct(v)}}</td>`;
+        return `<td>${{htmlEscape(v ?? "")}}</td>`;
+      }}).join("");
+      return `<tr>${{tds}}</tr>`;
+    }}).join("");
+    els.historyTableWrap.innerHTML = `<table><thead><tr>${{header}}</tr></thead><tbody>${{rows}}</tbody></table>`;
   }}
 
-  function plotScore(figDict) {{
-    Plotly.newPlot("scoreChart", figDict.data, figDict.layout, cfg);
-  }}
+  function renderDrill(label, metricKey) {{
+    const metric = METRICS.find(m => m.key === metricKey) || {{ label:"Overall" }};
+    els.drillTitle.textContent = `${{metric.label}} - ${{label}}`;
 
-  function plotTrend(figDict) {{
-    if (!figDict) {{
-      document.getElementById("trendChart").innerHTML = "<div class='muted'>Trend appears after 2+ runs.</div>";
+    const runIssues = issuesForRun(label);
+    const filtered = metric.label === "Overall"
+      ? runIssues
+      : runIssues.filter(x => String(x.dimension || "").toLowerCase() === metric.label.toLowerCase());
+
+    if (filtered.length === 0) {{
+      els.drillTableWrap.innerHTML = `<div class="panel-note">No issues found for this selection.</div>`;
       return;
     }}
-    Plotly.newPlot("trendChart", figDict.data, figDict.layout, cfg);
-  }}
 
-  function issuesForRun(runId) {{
-    if (!ISSUES) return [];
-    return ISSUES.filter(x => String(x.run_id) === String(runId));
-  }}
-
-  function renderIssues(runId) {{
-    const rows = issuesForRun(runId);
-    document.getElementById("kpiIssues").textContent = String(rows.length);
-    document.getElementById("issueMeta").textContent = rows.length ? `run_id: ${{runId}}` : `No issues for run_id: ${{runId}}`;
-
-    const t = document.getElementById("issuesTable");
     const cols = ["dimension","rule","column","failed_count","failed_pct","sample_values"];
-    const thead = `<thead><tr>${{cols.map(c => `<th>${{c}}</th>`).join("")}}</tr></thead>`;
-    const tbody = `<tbody>${{rows.map(r => {{
-      return `<tr>${{cols.map(c => `<td>${{r[c]}}</td>`).join("")}}</tr>`;
-    }}).join("")}}</tbody>`;
-    t.innerHTML = thead + tbody;
+    const header = cols.map(c => `<th>${{htmlEscape(c)}}</th>`).join("");
+    const rows = filtered.slice(0,25).map(x => {{
+      const tds = cols.map(c => {{
+        const v = x[c];
+        if (c === "failed_pct") return `<td class="right">${{fmtPct(v)}}</td>`;
+        if (c === "failed_count") return `<td class="right">${{htmlEscape(v ?? 0)}}</td>`;
+        return `<td>${{htmlEscape(v ?? "")}}</td>`;
+      }}).join("");
+      return `<tr>${{tds}}</tr>`;
+    }}).join("");
+
+    els.drillTableWrap.innerHTML = `<table><thead><tr>${{header}}</tr></thead><tbody>${{rows}}</tbody></table><div class="hint">Showing up to 25 rows.</div>`;
   }}
 
-  function updateScoreForRun(runId) {{
-    const run = RUNS.find(r => String(r.run_id) === String(runId)) || RUNS[RUNS.length - 1];
-    const labels = ["Completeness","Validity","Uniqueness","Timeliness","Overall"];
-    const vals = [run.completeness_pct, run.validity_pct, run.uniqueness_pct, run.timeliness_pct, run.overall_pct];
+  function attachButtons() {{
+    els.btnDark.addEventListener("click", () => {{
+      document.documentElement.classList.toggle("dark");
+      renderAll(els.runSelect.value);
+    }});
+    els.btnPrint.addEventListener("click", () => window.print());
+    els.btnPng.addEventListener("click", async () => {{
+      const png = await Plotly.toImage("barChart", {{ format:"png", height:600, width:900 }});
+      const a = document.createElement("a");
+      a.href = png;
+      a.download = "dq_chart.png";
+      a.click();
+    }});
+    els.btnExport.addEventListener("click", () => {{
+      const label = els.runSelect.value;
+      const metric = METRICS.find(m => m.key === activeMetric) || {{ label:"Overall" }};
+      const runIssues = issuesForRun(label);
+      const filtered = metric.label === "Overall"
+        ? runIssues
+        : runIssues.filter(x => String(x.dimension || "").toLowerCase() === metric.label.toLowerCase());
 
-    const fig = JSON.parse(JSON.stringify(SCORE_FIG));
-    const y = [];
-    const text = [];
-    const colors = [];
-
-    function level(score) {{
-      if (score === null || score === undefined || Number.isNaN(score)) return "unknown";
-      if (score >= {THRESH_GOOD}) return "good";
-      if (score >= {THRESH_WARN}) return "warn";
-      return "crit";
-    }}
-
-    for (const v of vals) {{
-      if (v === null || v === undefined || Number.isNaN(v)) {{
-        y.push(0); text.push(""); colors.push("#9ca3af");
-      }} else {{
-        y.push(Number(v));
-        text.push(`${{Number(v).toFixed(2)}}%`);
-        const lvl = level(Number(v));
-        colors.push(lvl === "good" ? "#16a34a" : (lvl === "warn" ? "#f59e0b" : "#dc2626"));
+      if (!filtered.length) {{
+        alert("Nothing to export for the current drill-down selection.");
+        return;
       }}
-    }}
 
-    fig.data[0].x = labels;
-    fig.data[0].y = y;
-    fig.data[0].text = text;
-    fig.data[0].marker = {{ color: colors }};
-    Plotly.react("scoreChart", fig.data, fig.layout, cfg);
+      const cols = ["dimension","rule","column","failed_count","failed_pct","sample_values"];
+      const lines = [
+        cols.join(","),
+        ...filtered.map(r => cols.map(c => {{
+          const v = r[c] ?? "";
+          const s = String(v).replaceAll('"','""');
+          return `"${{s}}"`;
+        }}).join(","))
+      ];
 
-    document.getElementById("kpiOverall").textContent = pct(run.overall_pct);
-    document.getElementById("kpiRows").textContent = (run.rows_raw === null || run.rows_raw === undefined) ? "N/A" : run.rows_raw;
-    document.getElementById("kpiRules").textContent = "Rules: " + (run.rules_version || "—");
-
-    const badge = document.getElementById("kpiBadge");
-    const lvl = level(run.overall_pct);
-    badge.className = "badge " + lvl;
-    badge.textContent = lvl.toUpperCase();
-  }}
-
-  function bind() {{
-    document.getElementById("runSelect").addEventListener("change", (e) => {{
-      const runId = e.target.value;
-      updateScoreForRun(runId);
-      renderIssues(runId);
+      const blob = new Blob([lines.join("\\n")], {{ type:"text/csv;charset=utf-8" }});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `dq_drilldown_${{metric.label.toLowerCase()}}_${{label.replaceAll(" ","_")}}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
     }});
-
-    document.getElementById("btnPrint").addEventListener("click", () => window.print());
-
-    document.getElementById("themeToggle").addEventListener("click", () => {{
-      const cur = document.documentElement.getAttribute("data-theme") || "light";
-      setTheme(cur === "dark" ? "light" : "dark");
-    }});
+    els.btnRun.addEventListener("click", () => alert("This HTML is a report viewer. Run the pipeline in the CLI, then regenerate the report."));
+    els.runSelect.addEventListener("change", () => renderAll(els.runSelect.value));
   }}
 
-  function init() {{
-    initTheme();
-    renderRunSelect();
-    renderHistoryTable();
-    plotScore(SCORE_FIG);
-    plotTrend(TREND_FIG);
-    bind();
-
-    const latestId = RUNS[RUNS.length - 1].run_id;
-    updateScoreForRun(latestId);
-    renderIssues(latestId);
+  function renderAll(label) {{
+    renderCards(label);
+    renderBar(label);
+    renderTrend(label);
+    renderDrill(label, activeMetric);
   }}
 
-  init();
+  // bootstrap
+  buildRunSelect();
+  renderTrendChecks();
+  renderHistoryTable();
+  attachButtons();
+  renderAll(els.runSelect.value);
 </script>
 </body>
 </html>
 """
-    OUT_HTML.write_text(html, encoding="utf-8")
-    print(f"Wrote: {OUT_HTML} | exists: {OUT_HTML.exists()}")
+
+
+def main() -> int:
+    _ensure_report_dirs()
+
+    summary = _read_summary()
+    issues = _read_issues()
+
+    _write_excel(summary=summary, issues=issues)
+
+    html = _build_html(summary_records=_to_records(summary), issues_records=_to_records(issues))
+    HTML_OUT.write_text(html, encoding="utf-8")
+
+    print(f"Wrote: {XLSX_OUT} | exists: {XLSX_OUT.exists()}")
+    print(f"Wrote: {HTML_OUT} | exists: {HTML_OUT.exists()}")
+    print(f"Summary CSV: {SUMMARY_CSV} | exists: {SUMMARY_CSV.exists()}")
+    print(f"Issues CSV:  {ISSUES_CSV} | exists: {ISSUES_CSV.exists()}")
+    print(f"Clean CSV:   {CLEAN_CSV} | exists: {CLEAN_CSV.exists()}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,11 +1,15 @@
-from pathlib import Path
+from __future__ import annotations
 
-ROOT = Path(__file__).resolve().parents[2]
-DATA = ROOT / "data"
-REPORTS = ROOT / "reports"
+from .make_synth import main as make_synth_main
+from .run_dq import main as run_dq_main
+from .report import main as report_main
 
-SYNTHETIC_DIR = DATA / "synthetic"
-OUTPUT_DIR = DATA / "output"
 
-INPUT = SYNTHETIC_DIR / "input.csv"
-CLEAN = OUTPUT_DIR / "clean.csv"
+def main() -> None:
+    make_synth_main()
+    run_dq_main()
+    report_main()
+
+
+if __name__ == "__main__":
+    main()

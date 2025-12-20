@@ -1,66 +1,40 @@
 from __future__ import annotations
 
-import subprocess
-import sys
-from pathlib import Path
-
 import typer
 
-app = typer.Typer(add_completion=False, help="DQHub CLI")
+from .make_synth import main as make_synth_main
+from .run_dq import main as run_dq_main
+from .report import main as report_main
+from .verify import main as verify_main
+from .pipeline import main as pipeline_main
 
-PKG_DIR = Path(__file__).resolve().parent  # .../src/dqhub
-
-
-def _run(module_file: str, *args: str) -> int:
-    """
-    Runs a module file (located inside the dqhub package) using the current venv interpreter.
-    This keeps the CLI working both in editable installs and in packaged installs.
-    """
-    cmd = [sys.executable, str(PKG_DIR / module_file), *args]
-    return subprocess.call(cmd)
+app = typer.Typer(help="DQ Hub CLI")
 
 
-@app.command()
+@app.command("synth")
 def synth() -> None:
-    raise SystemExit(_run("make_synth.py"))
+    make_synth_main()
 
 
-@app.command()
+@app.command("clean")
 def clean() -> None:
-    raise SystemExit(_run("run_dq.py"))
+    run_dq_main()
 
 
-@app.command()
-def verify() -> None:
-    raise SystemExit(_run("verify.py"))
-
-
-@app.command()
+@app.command("report")
 def report() -> None:
-    raise SystemExit(_run("report.py"))
+    report_main()
 
 
-@app.command()
+@app.command("verify")
+def verify() -> None:
+    verify_main()
+
+
+@app.command("pipeline")
 def pipeline() -> None:
-    if _run("make_synth.py") != 0:
-        raise SystemExit(2)
-    if _run("run_dq.py") != 0:
-        raise SystemExit(2)
-    if _run("verify.py") != 0:
-        raise SystemExit(2)
-    if _run("report.py") != 0:
-        raise SystemExit(2)
-
-    typer.echo("All steps completed successfully.")
+    pipeline_main()
 
 
-def main() -> int:
-    """
-    Entry point for `dqhub` console script and `python -m dqhub`.
-    """
+def main() -> None:
     app()
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
