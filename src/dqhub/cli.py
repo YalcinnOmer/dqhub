@@ -8,33 +8,37 @@ from .report import main as report_main
 from .verify import main as verify_main
 from .pipeline import main as pipeline_main
 
-app = typer.Typer(help="DQ Hub CLI")
-
+app = typer.Typer(
+    help="DQ Hub CLI - synthetic data generation, data-quality checks, and dashboard reports."
+)
 
 @app.command("synth")
-def synth() -> None:
-    make_synth_main()
-
+def synth(
+    rows: int = typer.Option(522, help="Number of synthetic rows to generate."),
+    seed: int = typer.Option(42, help="Random seed for deterministic output."),
+    scenario: str = typer.Option(
+        "auto",
+        help="Scenario: baseline | improved | auto. Auto uses baseline for first run, improved afterwards.",
+    ),
+) -> None:
+    raise SystemExit(make_synth_main(rows=rows, seed=seed, scenario=scenario))
 
 @app.command("clean")
 def clean() -> None:
-    run_dq_main()
-
+    raise SystemExit(run_dq_main())
 
 @app.command("report")
 def report() -> None:
-    report_main()
-
+    raise SystemExit(report_main())
 
 @app.command("verify")
 def verify() -> None:
-    verify_main()
-
+    raise SystemExit(verify_main())
 
 @app.command("pipeline")
 def pipeline() -> None:
-    pipeline_main()
+    raise SystemExit(pipeline_main())
 
-
-def main() -> None:
+def main() -> int:
     app()
+    return 0

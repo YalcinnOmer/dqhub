@@ -4,6 +4,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
 import json
+import html as html_lib
 
 import pandas as pd
 
@@ -19,7 +20,6 @@ CLEAN_CSV = OUTPUT_DIR / "clean.csv"
 
 HTML_OUT = REPORTS_DIR / "DQ_Report.html"
 XLSX_OUT = REPORTS_DIR / "DQ_Report.xlsx"
-
 
 METRICS = [
     ("completeness_pct", "Completeness"),
@@ -38,28 +38,42 @@ DIMS = [
 
 
 def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
-def _ensure_report_dirs() -> None:
+def _ensure_dirs() -> None:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _read_summary() -> pd.DataFrame:
     if not SUMMARY_CSV.exists():
-        raise FileNotFoundError(f"Missing {SUMMARY_CSV}. Run `dqhub clean` first.")
+        raise FileNotFoundError(f"Missing {SUMMARY_CSV}. Run `python -m dqhub clean` first.")
     df = pd.read_csv(SUMMARY_CSV)
     if df.empty:
         raise ValueError("dq_summary.csv is empty.")
     if "run_label" not in df.columns:
-        df.insert(0, "run_label", [f"Run {i+1}" for i in range(len(df))])
+        df.insert(0, "run_label", [f"Run {i + 1}" for i in range(len(df))])
     return df
 
 
 def _read_issues() -> pd.DataFrame:
     if not ISSUES_CSV.exists():
         return pd.DataFrame(
-            columns=["run_label", "run_id", "dimension", "rule", "column", "failed_count", "failed_pct", "sample_values"]
+            columns=[
+                "run_label",
+                "run_id",
+                "dimension",
+                "rule",
+                "column",
+                "failed_count",
+                "failed_pct",
+                "sample_values",
+            ]
         )
     df = pd.read_csv(ISSUES_CSV)
     if "run_label" not in df.columns:
@@ -67,6 +81,26 @@ def _read_issues() -> pd.DataFrame:
     if "run_id" not in df.columns:
         df["run_id"] = ""
     return df
+
+
+def _backfill_issue_labels(summary: pd.DataFrame, issues: pd.DataFrame) -> pd.DataFrame:
+    if issues.empty:
+        return issues
+
+    issues = issues.copy()
+    issues["run_label"] = issues.get("run_label", "").astype("string").fillna("")
+    issues["run_id"] = issues.get("run_id", "").astype("string").fillna("")
+
+    if "run_id" in summary.columns and "run_label" in summary.columns:
+        mapping = summary[["run_id", "run_label"]].dropna()
+        mapping = mapping[mapping["run_id"].astype(str).str.len() > 0]
+        if not mapping.empty:
+            missing = issues["run_label"].str.len() == 0
+            if missing.any():
+                joined = issues.loc[missing, ["run_id"]].merge(mapping, on="run_id", how="left")
+                issues.loc[missing, "run_label"] = joined["run_label"].fillna("")
+
+    return issues
 
 
 def _dataset_line() -> str:
@@ -81,15 +115,11 @@ def _dataset_line() -> str:
 
 
 def _to_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    # Convert NaN to None for clean JSON
     out: list[dict[str, Any]] = []
     for row in df.to_dict(orient="records"):
-        clean = {}
+        clean: dict[str, Any] = {}
         for k, v in row.items():
-            if pd.isna(v):
-                clean[k] = None
-            else:
-                clean[k] = v
+            clean[k] = None if pd.isna(v) else v
         out.append(clean)
     return out
 
@@ -103,7 +133,6 @@ def _write_excel(summary: pd.DataFrame, issues: pd.DataFrame) -> None:
         for ws_name in ["Summary", "Issues"]:
             ws = wb[ws_name]
             ws.freeze_panes = "A2"
-            # basic width autosize
             for col in ws.columns:
                 col_letter = col[0].column_letter
                 max_len = 10
@@ -111,119 +140,125 @@ def _write_excel(summary: pd.DataFrame, issues: pd.DataFrame) -> None:
                     if cell.value is None:
                         continue
                     max_len = max(max_len, len(str(cell.value)))
-                ws.column_dimensions[col_letter].width = min(max_len + 2, 45)
+                ws.column_dimensions[col_letter].width = min(max_len + 2, 52)
 
 
-def _build_html(summary_records: list[dict[str, Any]], issues_records: list[dict[str, Any]]) -> str:
-    generated = _now_utc_iso()
-    dataset_line = _dataset_line()
-
-    # Keep file names relative (works when opening reports/DQ_Report.html locally)
-    xlsx_name = XLSX_OUT.name
-    summary_name = SUMMARY_CSV.name
-    issues_name = ISSUES_CSV.name
-
-    return f"""<!doctype html>
+HTML_TEMPLATE = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Data Quality Dashboard</title>
+  <title>DQ Hub - Data Quality Dashboard</title>
   <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
   <style>
-    :root {{
+    :root {
       --bg: #f6f7fb; --panel: #ffffff; --text: #111827; --muted: #6b7280; --border: #e5e7eb;
-      --shadow: 0 1px 2px rgba(0,0,0,0.05); --good: #16a34a; --chip: #eef2ff;
-    }}
-    html.dark {{
+      --shadow: 0 1px 2px rgba(0,0,0,0.06); --good: #16a34a; --warn: #f59e0b; --bad: #ef4444;
+      --chip: #eef2ff; --input: rgba(148,163,184,0.08);
+    }
+    html.dark {
       --bg: #0b1220; --panel: #0f172a; --text: #e5e7eb; --muted: #9ca3af; --border: #1f2937;
-      --shadow: 0 1px 2px rgba(0,0,0,0.35); --good: #22c55e; --chip: rgba(99,102,241,0.12);
-    }}
-    body {{
+      --shadow: 0 1px 2px rgba(0,0,0,0.35); --good: #22c55e; --warn: #fbbf24; --bad: #fb7185;
+      --chip: rgba(99,102,241,0.12); --input: rgba(148,163,184,0.10);
+    }
+    body {
       margin: 0; background: var(--bg); color: var(--text);
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
-    }}
-    .container {{ max-width: 1120px; margin: 28px auto 60px; padding: 0 18px; }}
-    header {{ display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:14px; }}
-    h1 {{ margin:0; font-size:28px; letter-spacing:-0.02em; }}
-    .sub {{ margin-top:6px; color:var(--muted); font-size:13px; line-height:1.4; }}
-    .toolbar {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }}
-    .btn, select {{
+    }
+    .container { max-width: 1160px; margin: 28px auto 64px; padding: 0 18px; }
+    header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:14px; }
+    h1 { margin:0; font-size:28px; letter-spacing:-0.02em; }
+    .sub { margin-top:6px; color:var(--muted); font-size:13px; line-height:1.45; }
+    .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
+    .btn, select, input {
       border: 1px solid var(--border); background: var(--panel); color: var(--text);
-      padding: 8px 10px; border-radius: 999px; font-size: 12px; box-shadow: var(--shadow); cursor: pointer;
+      padding: 8px 10px; border-radius: 999px; font-size: 12px; box-shadow: var(--shadow);
       text-decoration: none;
-    }}
-    select {{ cursor:pointer; padding-right:28px; }}
-    .cards {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-top:16px; }}
-    @media (max-width: 980px) {{ .cards {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} }}
-    @media (max-width: 520px) {{
-      .cards {{ grid-template-columns:1fr; }}
-      header {{ flex-direction:column; align-items:stretch; }}
-      .toolbar {{ justify-content:flex-start; }}
-    }}
-    .card {{
+    }
+    select { cursor:pointer; padding-right:28px; }
+    input {
+      background: var(--input);
+      box-shadow: none;
+      border-radius: 10px;
+      padding: 8px 10px;
+      min-width: 220px;
+    }
+    .btn { cursor: pointer; }
+    .cards { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-top:16px; }
+    @media (max-width: 980px) { .cards { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+    @media (max-width: 520px) {
+      .cards { grid-template-columns:1fr; }
+      header { flex-direction:column; align-items:stretch; }
+      .toolbar { justify-content:flex-start; }
+      input { min-width: 0; width: 100%; }
+    }
+    .card {
       background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
       padding: 14px; box-shadow: var(--shadow);
-    }}
-    .card .label {{
+    }
+    .card .label {
       font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;
       display:flex; align-items:center; justify-content:space-between; gap:10px;
-    }}
-    .chip {{
+    }
+    .chip {
       font-size: 11px; padding: 3px 8px; border-radius: 999px; background: var(--chip);
-      border: 1px solid var(--border); color: var(--good); font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
-    }}
-    .value {{ font-size: 20px; font-weight: 800; margin-top: 6px; }}
-    .meta {{ font-size: 12px; color: var(--muted); margin-top: 4px; }}
-    .grid2 {{ display:grid; grid-template-columns:1.2fr 1fr; gap:12px; margin-top:12px; align-items:stretch; }}
-    @media (max-width: 980px) {{ .grid2 {{ grid-template-columns:1fr; }} }}
-    .panel {{
-      background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px; box-shadow: var(--shadow);
-    }}
-    .panel-header {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:6px; }}
-    .panel-title {{ font-weight:800; font-size:13px; }}
-    .panel-note {{ font-size:12px; color: var(--muted); }}
-    .checks {{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; color:var(--muted); font-size:12px; margin-bottom:6px; }}
-    .checks label {{ display:inline-flex; align-items:center; gap:6px; cursor:pointer; user-select:none; }}
-    .section {{ margin-top: 14px; }}
-    table {{
+      border: 1px solid var(--border); font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .value { font-size: 20px; font-weight: 900; margin-top: 6px; }
+    .meta { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .grid2 { display:grid; grid-template-columns:1.2fr 1fr; gap:12px; margin-top:12px; align-items:stretch; }
+    @media (max-width: 980px) { .grid2 { grid-template-columns:1fr; } }
+    .panel {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+      padding: 12px; box-shadow: var(--shadow);
+    }
+    .panel-header { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:6px; }
+    .panel-title { font-weight:900; font-size:13px; }
+    .panel-note { font-size:12px; color: var(--muted); }
+    .checks { display:flex; gap:10px; flex-wrap:wrap; align-items:center; color:var(--muted); font-size:12px; margin-bottom:6px; }
+    .checks label { display:inline-flex; align-items:center; gap:6px; cursor:pointer; user-select:none; }
+    .section { margin-top: 14px; }
+    table {
       width:100%; border-collapse:collapse; font-size:12px; overflow:hidden;
       border-radius:10px; border:1px solid var(--border);
-    }}
-    th, td {{ padding:10px; border-bottom:1px solid var(--border); vertical-align:top; }}
-    th {{
+    }
+    th, td { padding:10px; border-bottom:1px solid var(--border); vertical-align:top; }
+    th {
       text-align:left; background: rgba(148,163,184,0.08); color: var(--muted);
-      font-weight:700; font-size:11px; text-transform:lowercase;
-    }}
-    tr:last-child td {{ border-bottom:none; }}
-    .right {{ text-align:right; }}
-    .hint {{ font-size:12px; color: var(--muted); margin-top:6px; }}
+      font-weight:800; font-size:11px; text-transform:lowercase;
+    }
+    tr:last-child td { border-bottom:none; }
+    .right { text-align:right; }
+    .hint { font-size:12px; color: var(--muted); margin-top:6px; }
+    .row {
+      display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;
+      margin-top: 10px;
+    }
+    .muted { color: var(--muted); }
   </style>
 </head>
 <body>
   <div class="container">
     <header>
       <div>
-        <h1>Data Quality Dashboard</h1>
+        <h1>DQ Hub Dashboard</h1>
         <div class="sub">
-          Click a metric bar to open drill-down details. Toggle trend dimensions using filters or legend.<br/>
-          <span style="opacity:0.85">Generated: {generated}</span>
+          Drill down by clicking a bar (left). Filter drill-down results using the search box.<br/>
+          <span style="opacity:0.85">Generated: ___DQHUB_GENERATED___</span>
         </div>
       </div>
       <div class="toolbar">
-        <button class="btn" id="btnRun">Run</button>
         <select id="runSelect" aria-label="Select run"></select>
-        <button class="btn" id="btnDark">Toggle Dark Mode</button>
+        <button class="btn" id="btnDark" title="Toggle dark mode">Toggle Dark</button>
       </div>
     </header>
 
     <div class="toolbar" style="justify-content:flex-end; margin-top: 8px;">
-      <button class="btn" id="btnExport">Export</button>
-      <button class="btn" id="btnPrint">Print (PDF)</button>
-      <button class="btn" id="btnPng">Chart PNG</button>
-      <a class="btn" href="{xlsx_name}" download>Excel</a>
-      <a class="btn" href="{summary_name}" download>dq_summary.csv</a>
-      <a class="btn" href="{issues_name}" download>dq_issues.csv</a>
+      <button class="btn" id="btnPrint" title="Print / Save as PDF">Print (PDF)</button>
+      <button class="btn" id="btnPng" title="Export bar chart PNG">Chart PNG</button>
+      <a class="btn" href="___DQHUB_XLSX_NAME___" download>Excel</a>
+      <a class="btn" href="___DQHUB_SUMMARY_NAME___" download>dq_summary.csv</a>
+      <a class="btn" href="___DQHUB_ISSUES_NAME___" download>dq_issues.csv</a>
     </div>
 
     <div class="cards">
@@ -236,17 +271,17 @@ def _build_html(summary_records: list[dict[str, Any]], issues_records: list[dict
       <div class="card">
         <div class="label"><span>Lowest Dimension</span></div>
         <div class="value" id="lowestValue">N/A</div>
-        <div class="meta">All metrics available.</div>
+        <div class="meta">Focus here first (root cause).</div>
       </div>
 
       <div class="card">
-        <div class="label"><span>Rows (Raw)</span></div>
+        <div class="label"><span>Rows</span></div>
         <div class="value" id="rowsValue">0</div>
         <div class="meta" id="rulesMeta">Rules: N/A</div>
       </div>
 
       <div class="card">
-        <div class="label"><span>Issues (Current Run)</span></div>
+        <div class="label"><span>Issue Groups (Run)</span></div>
         <div class="value" id="issuesValue">0</div>
         <div class="meta" id="issuesMeta">No issues detected.</div>
       </div>
@@ -254,48 +289,76 @@ def _build_html(summary_records: list[dict[str, Any]], issues_records: list[dict
 
     <div class="grid2">
       <div class="panel">
-        <div class="panel-header"><div class="panel-title">Current DQ Score</div><div class="panel-note">Click bars for details</div></div>
+        <div class="panel-header">
+          <div>
+            <div class="panel-title">Current DQ Score</div>
+            <div class="panel-note">Click a bar 🌐 to set drill-down dimension</div>
+          </div>
+          <div class="panel-note muted" id="activeMetricNote">Active: Overall</div>
+        </div>
         <div id="barChart" style="height:320px;"></div>
+        <div class="hint">Tip: Regenerate via <span class="muted">python -m dqhub pipeline</span></div>
       </div>
 
       <div class="panel">
         <div class="panel-header">
-          <div><div class="panel-title">Trend</div><div class="checks" id="trendChecks"></div></div>
-          <div class="panel-note" id="trendMode">Default: Overall</div>
+          <div>
+            <div class="panel-title">Trend</div>
+            <div class="checks" id="trendChecks"></div>
+          </div>
+          <div class="panel-note" id="historyHint"></div>
         </div>
         <div id="trendChart" style="height:320px;"></div>
-        <div class="hint" id="historyHint"></div>
       </div>
     </div>
 
     <div class="section panel">
       <div class="panel-header">
-        <div><div class="panel-title">Metric Details (Drill-down)</div><div class="panel-note">Overall is an aggregate score. Use dimension drill-down to identify root causes.</div></div>
+        <div>
+          <div class="panel-title">Metric Details (Drill-down)</div>
+          <div class="panel-note">Investigate failures by dimension, rule, and column.</div>
+        </div>
         <div class="panel-note" id="drillTitle">Overall -</div>
       </div>
-      <div class="panel-note" style="margin-bottom: 8px;">{dataset_line}</div>
-      <div id="drillTableWrap"></div>
+
+      <div class="row">
+        <div class="panel-note">___DQHUB_DATASET_LINE___</div>
+        <div class="toolbar" style="justify-content:flex-end; gap:8px; margin:0;">
+          <select id="metricSelect" aria-label="Select drill-down metric"></select>
+          <input id="drillSearch" type="search" placeholder="Search (rule/column/sample)..." aria-label="Search drill-down table"/>
+          <button class="btn" id="btnExport" title="Export drill-down CSV">Export</button>
+        </div>
+      </div>
+
+      <div id="drillTableWrap" style="margin-top:10px;"></div>
+      <div class="hint" id="drillHint"></div>
     </div>
 
     <div class="section panel">
-      <div class="panel-header"><div class="panel-title">Run History</div><div class="panel-note">Run labels only (no timestamps)</div></div>
+      <div class="panel-header">
+        <div>
+          <div class="panel-title">Run History</div>
+          <div class="panel-note">Scores per run (append-only history)</div>
+        </div>
+      </div>
       <div id="historyTableWrap"></div>
     </div>
   </div>
 
 <script>
-  const SUMMARY = {json.dumps(summary_records, ensure_ascii=False)};
-  const ISSUES  = {json.dumps(issues_records, ensure_ascii=False)};
-  const METRICS = {json.dumps([{"key": k, "label": lbl} for k, lbl in METRICS], ensure_ascii=False)};
-  const DIMS    = {json.dumps([{"key": k, "label": lbl} for k, lbl in DIMS], ensure_ascii=False)};
+  const SUMMARY = ___DQHUB_SUMMARY_JSON___;
+  const ISSUES  = ___DQHUB_ISSUES_JSON___;
+  const METRICS = ___DQHUB_METRICS_JSON___;
+  const DIMS    = ___DQHUB_DIMS_JSON___;
 
-  const els = {{
+  const els = {
     runSelect: document.getElementById("runSelect"),
+    metricSelect: document.getElementById("metricSelect"),
+    drillSearch: document.getElementById("drillSearch"),
+    btnExport: document.getElementById("btnExport"),
     btnDark: document.getElementById("btnDark"),
     btnPrint: document.getElementById("btnPrint"),
     btnPng: document.getElementById("btnPng"),
-    btnExport: document.getElementById("btnExport"),
-    btnRun: document.getElementById("btnRun"),
     overallValue: document.getElementById("overallValue"),
     overallDelta: document.getElementById("overallDelta"),
     chipStatus: document.getElementById("chipStatus"),
@@ -309,25 +372,37 @@ def _build_html(summary_records: list[dict[str, Any]], issues_records: list[dict
     drillTitle: document.getElementById("drillTitle"),
     drillTableWrap: document.getElementById("drillTableWrap"),
     historyTableWrap: document.getElementById("historyTableWrap"),
-  }};
+    drillHint: document.getElementById("drillHint"),
+    activeMetricNote: document.getElementById("activeMetricNote"),
+  };
 
-  function fmtPct(v) {{
+  function fmtPct(v) {
     if (v === null || v === undefined || Number.isNaN(Number(v))) return "N/A";
     return Number(v).toFixed(2) + "%";
-  }}
-  function safeNum(v, fallback=0) {{
+  }
+  function safeNum(v, fallback=0) {
     const n = Number(v);
     return Number.isFinite(n) ? n : fallback;
-  }}
-  function getRunLabels() {{ return SUMMARY.map(r => String(r.run_label)); }}
-  function getRunRow(label) {{ return SUMMARY.find(r => String(r.run_label) === String(label)); }}
-  function getPrevLabel(label) {{
+  }
+  function htmlEscape(s) {
+    return String(s)
+      .replaceAll("&","&amp;")
+      .replaceAll("<","&lt;")
+      .replaceAll(">","&gt;")
+      .replaceAll('"',"&quot;")
+      .replaceAll("'","&#039;");
+  }
+
+  function getRunLabels() { return SUMMARY.map(r => String(r.run_label)); }
+  function getRunRow(label) { return SUMMARY.find(r => String(r.run_label) === String(label)); }
+
+  function getPrevLabel(label) {
     const labels = getRunLabels();
     const idx = labels.indexOf(String(label));
     if (idx <= 0) return null;
     return labels[idx - 1];
-  }}
-  function deltaPP(metricKey, label) {{
+  }
+  function deltaPP(metricKey, label) {
     const prev = getPrevLabel(label);
     if (!prev) return null;
     const curRow = getRunRow(label);
@@ -337,45 +412,70 @@ def _build_html(summary_records: list[dict[str, Any]], issues_records: list[dict
     const prv = safeNum(prevRow[metricKey], NaN);
     if (!Number.isFinite(cur) || !Number.isFinite(prv)) return null;
     return cur - prv;
-  }}
-  function lowestDimension(row) {{
-    let best = {{ label: "N/A", val: null }};
-    DIMS.forEach(d => {{
+  }
+
+  function lowestDimension(row) {
+    let best = { label: "N/A", val: null };
+    DIMS.forEach(d => {
       const v = safeNum(row[d.key], NaN);
       if (!Number.isFinite(v)) return;
-      if (best.val === null || v < best.val) best = {{ label: d.label, val: v }};
-    }});
+      if (best.val === null || v < best.val) best = { label: d.label, val: v };
+    });
     return best;
-  }}
-  function issuesForRun(label) {{
+  }
+
+  function parseSampleValues(v) {
+    if (v === null || v === undefined) return "";
+    const s = String(v).trim();
+    if (!s) return "";
+    try {
+      const parsed = JSON.parse(s);
+      if (Array.isArray(parsed)) {
+        const vals = parsed.map(x => (x === null || x === undefined) ? "" : String(x));
+        return vals.filter(Boolean).join(", ");
+      }
+      return String(parsed);
+    } catch {
+      return s;
+    }
+  }
+
+  function issuesForRun(label) {
     const runIssues = ISSUES.filter(x => String(x.run_label || "") === String(label));
     return runIssues.filter(x => safeNum(x.failed_count, 0) > 0);
-  }}
-  function buildRunSelect() {{
+  }
+
+  function buildRunSelect() {
     els.runSelect.innerHTML = "";
     const labels = getRunLabels();
-    labels.forEach((lbl, i) => {{
+    labels.forEach((lbl, i) => {
       const opt = document.createElement("option");
       opt.value = lbl;
-      const isLatest = i === labels.length - 1;
-      opt.textContent = isLatest ? `${{lbl}} (latest)` : lbl;
+      opt.textContent = (i === labels.length - 1) ? `${lbl} (latest)` : lbl;
       els.runSelect.appendChild(opt);
-    }});
+    });
     els.runSelect.value = labels[labels.length - 1];
-  }}
-  function statusChip(overallPct) {{
-    if (overallPct >= 95) return {{ text: "GOOD", color: "var(--good)" }};
-    if (overallPct >= 85) return {{ text: "OK", color: "#f59e0b" }};
-    return {{ text: "RISK", color: "#ef4444" }};
-  }}
-  function htmlEscape(s) {{
-    return String(s).replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
-      .replaceAll('"',"&quot;").replaceAll("'","&#039;");
-  }}
+  }
+
+  function buildMetricSelect() {
+    els.metricSelect.innerHTML = "";
+    METRICS.forEach(m => {
+      const opt = document.createElement("option");
+      opt.value = m.key;
+      opt.textContent = m.label;
+      els.metricSelect.appendChild(opt);
+    });
+  }
+
+  function statusChip(overallPct) {
+    if (overallPct >= 95) return { text: "GOOD", color: "var(--good)" };
+    if (overallPct >= 85) return { text: "OK", color: "var(--warn)" };
+    return { text: "RISK", color: "var(--bad)" };
+  }
 
   let activeMetric = "overall_pct";
 
-  function renderCards(label) {{
+  function renderCards(label) {
     const row = getRunRow(label);
     const overall = safeNum(row.overall_pct, 0);
     els.overallValue.textContent = fmtPct(overall);
@@ -388,72 +488,75 @@ def _build_html(summary_records: list[dict[str, Any]], issues_records: list[dict
     els.chipStatus.style.color = st.color;
 
     const low = lowestDimension(row);
-    els.lowestValue.textContent = `${{low.label}} (${{fmtPct(low.val)}})`;
+    els.lowestValue.textContent = `${low.label} (${fmtPct(low.val)})`;
 
     els.rowsValue.textContent = String(row.rows_raw ?? "");
     els.rulesMeta.textContent = "Rules: " + String(row.rules_version ?? "N/A");
 
     const curIssues = issuesForRun(label);
     els.issuesValue.textContent = String(curIssues.length);
-    els.issuesMeta.textContent = curIssues.length === 0 ? "No issues detected." : "See drill-down for details.";
-  }}
+    els.issuesMeta.textContent = curIssues.length === 0 ? "No issues detected." : "Use drill-down for details.";
+  }
 
-  function renderBar(label) {{
+  function renderBar(label) {
     const row = getRunRow(label);
     const x = METRICS.map(m => m.label);
     const y = METRICS.map(m => safeNum(row[m.key], 0));
 
     Plotly.newPlot("barChart",
-      [{{ type:"bar", x, y, hovertemplate:"Metric: %{{x}}<br>Score: %{{y:.2f}}%<extra></extra>" }}],
-      {{
-        margin: {{ l:45, r:15, t:10, b:45 }},
-        yaxis: {{ range:[0,100], ticksuffix:"%", gridcolor:"rgba(148,163,184,0.25)" }},
+      [{ type:"bar", x, y, hovertemplate:"Metric: %{x}<br>Score: %{y:.2f}%<extra></extra>" }],
+      {
+        margin: { l:45, r:15, t:10, b:45 },
+        yaxis: { range:[0,100], ticksuffix:"%", gridcolor:"rgba(148,163,184,0.25)" },
         paper_bgcolor:"rgba(0,0,0,0)", plot_bgcolor:"rgba(0,0,0,0)",
-        font: {{ color: getComputedStyle(document.documentElement).getPropertyValue("--text").trim() }},
-      }},
-      {{ displayModeBar:false, responsive:true }}
+        font: { color: getComputedStyle(document.documentElement).getPropertyValue("--text").trim() },
+      },
+      { displayModeBar:false, responsive:true }
     );
 
-    document.getElementById("barChart").on("plotly_click", (ev) => {{
+    document.getElementById("barChart").on("plotly_click", (ev) => {
       const metricLabel = ev.points?.[0]?.x;
       const metric = METRICS.find(m => m.label === metricLabel);
       if (!metric) return;
       activeMetric = metric.key;
+      els.metricSelect.value = activeMetric;
+      els.activeMetricNote.textContent = "Active: " + metric.label;
       renderDrill(label, activeMetric);
-    }});
-  }}
+    });
+  }
 
-  function renderTrendChecks() {{
+  function renderTrendChecks() {
     els.trendChecks.innerHTML = "";
-    const make = (key, label, checked=true) => {{
+    const make = (key, label, checked=true) => {
       const id = "chk_" + key;
       const wrap = document.createElement("label");
-      wrap.innerHTML = `<input type="checkbox" id="${{id}}" ${{checked ? "checked" : ""}} /> <span>${{label}}</span>`;
+      wrap.innerHTML = `<input type="checkbox" id="${id}" ${checked ? "checked" : ""} /> <span>${label}</span>`;
       els.trendChecks.appendChild(wrap);
       wrap.querySelector("input").addEventListener("change", () => renderTrend(els.runSelect.value));
-    }};
+    };
     make("overall_pct", "Overall", true);
     make("completeness_pct", "Completeness", true);
     make("validity_pct", "Validity", true);
     make("uniqueness_pct", "Uniqueness", true);
     make("timeliness_pct", "Timeliness", true);
-  }}
-  function isChecked(key) {{
+  }
+  function isChecked(key) {
     const el = document.getElementById("chk_" + key);
     return el ? el.checked : false;
-  }}
-  function renderTrend(label) {{
+  }
+
+  function renderTrend(label) {
     const labels = getRunLabels();
     const traces = [];
-    const add = (key, name) => {{
+    const add = (key, name) => {
       if (!isChecked(key)) return;
-      traces.push({{
+      traces.push({
         type:"scatter", mode:"lines+markers", name,
         x: labels,
         y: SUMMARY.map(r => safeNum(r[key], NaN)),
-        hovertemplate: `${{name}}: %{{y:.2f}}%<extra></extra>`
-      }});
-    }};
+        hovertemplate: `${name}: %{y:.2f}%<extra></extra>`
+      });
+    };
     add("overall_pct","Overall");
     add("completeness_pct","Completeness");
     add("validity_pct","Validity");
@@ -461,121 +564,157 @@ def _build_html(summary_records: list[dict[str, Any]], issues_records: list[dict
     add("timeliness_pct","Timeliness");
 
     Plotly.newPlot("trendChart", traces,
-      {{
-        margin: {{ l:45, r:15, t:10, b:45 }},
-        yaxis: {{ range:[0,100], ticksuffix:"%", gridcolor:"rgba(148,163,184,0.25)" }},
+      {
+        margin: { l:45, r:15, t:10, b:45 },
+        yaxis: { range:[0,100], ticksuffix:"%", gridcolor:"rgba(148,163,184,0.25)" },
         paper_bgcolor:"rgba(0,0,0,0)", plot_bgcolor:"rgba(0,0,0,0)",
-        font: {{ color: getComputedStyle(document.documentElement).getPropertyValue("--text").trim() }},
-        legend: {{ orientation:"h", y: 1.15 }},
-      }},
-      {{ displayModeBar:false, responsive:true }}
+        font: { color: getComputedStyle(document.documentElement).getPropertyValue("--text").trim() },
+        legend: { orientation:"h", y: 1.15 },
+      },
+      { displayModeBar:false, responsive:true }
     );
-    els.historyHint.textContent = `Limited history: ${{labels.length}} runs.`;
-  }}
 
-  function renderHistoryTable() {{
+    els.historyHint.textContent = `History: ${labels.length} run(s).`;
+  }
+
+  function renderHistoryTable() {
     const cols = ["run_label","rows_raw","overall_pct","completeness_pct","validity_pct","uniqueness_pct","timeliness_pct"];
-    const header = cols.map(c => `<th>${{htmlEscape(c)}}</th>`).join("");
-    const rows = SUMMARY.map(r => {{
-      const tds = cols.map(c => {{
+    const header = cols.map(c => `<th>${htmlEscape(c)}</th>`).join("");
+    const rows = SUMMARY.map(r => {
+      const tds = cols.map(c => {
         const v = r[c];
-        if (String(c).endsWith("_pct")) return `<td class="right">${{fmtPct(v)}}</td>`;
-        return `<td>${{htmlEscape(v ?? "")}}</td>`;
-      }}).join("");
-      return `<tr>${{tds}}</tr>`;
-    }}).join("");
-    els.historyTableWrap.innerHTML = `<table><thead><tr>${{header}}</tr></thead><tbody>${{rows}}</tbody></table>`;
-  }}
+        if (String(c).endsWith("_pct")) return `<td class="right">${fmtPct(v)}</td>`;
+        return `<td>${htmlEscape(v ?? "")}</td>`;
+      }).join("");
+      return `<tr>${tds}</tr>`;
+    }).join("");
+    els.historyTableWrap.innerHTML = `<table><thead><tr>${header}</tr></thead><tbody>${rows}</tbody></table>`;
+  }
 
-  function renderDrill(label, metricKey) {{
-    const metric = METRICS.find(m => m.key === metricKey) || {{ label:"Overall" }};
-    els.drillTitle.textContent = `${{metric.label}} - ${{label}}`;
+  function drillFilterRows(rows) {
+    const q = String(els.drillSearch.value || "").trim().toLowerCase();
+    if (!q) return rows;
+    return rows.filter(x => {
+      const hay = [
+        x.dimension, x.rule, x.column, parseSampleValues(x.sample_values)
+      ].map(v => String(v || "").toLowerCase()).join(" | ");
+      return hay.includes(q);
+    });
+  }
+
+  function renderDrill(label, metricKey) {
+    const metric = METRICS.find(m => m.key === metricKey) || { label:"Overall" };
+    els.drillTitle.textContent = `${metric.label} - ${label}`;
 
     const runIssues = issuesForRun(label);
-    const filtered = metric.label === "Overall"
+    const byMetric = (metric.label === "Overall")
       ? runIssues
       : runIssues.filter(x => String(x.dimension || "").toLowerCase() === metric.label.toLowerCase());
 
-    if (filtered.length === 0) {{
+    const filtered = drillFilterRows(byMetric);
+
+    if (byMetric.length === 0) {
       els.drillTableWrap.innerHTML = `<div class="panel-note">No issues found for this selection.</div>`;
+      els.drillHint.textContent = "";
       return;
-    }}
+    }
+
+    if (filtered.length === 0) {
+      els.drillTableWrap.innerHTML = `<div class="panel-note">No matches for the current search.</div>`;
+      els.drillHint.textContent = `0 / ${byMetric.length} rows shown.`;
+      return;
+    }
 
     const cols = ["dimension","rule","column","failed_count","failed_pct","sample_values"];
-    const header = cols.map(c => `<th>${{htmlEscape(c)}}</th>`).join("");
-    const rows = filtered.slice(0,25).map(x => {{
-      const tds = cols.map(c => {{
+    const header = cols.map(c => `<th>${htmlEscape(c)}</th>`).join("");
+    const rows = filtered.slice(0, 50).map(x => {
+      const tds = cols.map(c => {
         const v = x[c];
-        if (c === "failed_pct") return `<td class="right">${{fmtPct(v)}}</td>`;
-        if (c === "failed_count") return `<td class="right">${{htmlEscape(v ?? 0)}}</td>`;
-        return `<td>${{htmlEscape(v ?? "")}}</td>`;
-      }}).join("");
-      return `<tr>${{tds}}</tr>`;
-    }}).join("");
+        if (c === "failed_pct") return `<td class="right">${fmtPct(v)}</td>`;
+        if (c === "failed_count") return `<td class="right">${htmlEscape(v ?? 0)}</td>`;
+        if (c === "sample_values") return `<td>${htmlEscape(parseSampleValues(v))}</td>`;
+        return `<td>${htmlEscape(v ?? "")}</td>`;
+      }).join("");
+      return `<tr>${tds}</tr>`;
+    }).join("");
 
-    els.drillTableWrap.innerHTML = `<table><thead><tr>${{header}}</tr></thead><tbody>${{rows}}</tbody></table><div class="hint">Showing up to 25 rows.</div>`;
-  }}
+    els.drillTableWrap.innerHTML = `<table><thead><tr>${header}</tr></thead><tbody>${rows}</tbody></table>`;
+    els.drillHint.textContent = `Showing ${Math.min(filtered.length, 50)} / ${filtered.length} (search applied).`;
+  }
 
-  function attachButtons() {{
-    els.btnDark.addEventListener("click", () => {{
+  function attachButtons() {
+    els.btnDark.addEventListener("click", () => {
       document.documentElement.classList.toggle("dark");
       renderAll(els.runSelect.value);
-    }});
+    });
     els.btnPrint.addEventListener("click", () => window.print());
-    els.btnPng.addEventListener("click", async () => {{
-      const png = await Plotly.toImage("barChart", {{ format:"png", height:600, width:900 }});
+    els.btnPng.addEventListener("click", async () => {
+      const png = await Plotly.toImage("barChart", { format:"png", height:600, width:900 });
       const a = document.createElement("a");
       a.href = png;
-      a.download = "dq_chart.png";
+      a.download = "dq_bar_chart.png";
       a.click();
-    }});
-    els.btnExport.addEventListener("click", () => {{
+    });
+    els.btnExport.addEventListener("click", () => {
       const label = els.runSelect.value;
-      const metric = METRICS.find(m => m.key === activeMetric) || {{ label:"Overall" }};
+      const metric = METRICS.find(m => m.key === activeMetric) || { label:"Overall" };
       const runIssues = issuesForRun(label);
-      const filtered = metric.label === "Overall"
+      const byMetric = (metric.label === "Overall")
         ? runIssues
         : runIssues.filter(x => String(x.dimension || "").toLowerCase() === metric.label.toLowerCase());
 
-      if (!filtered.length) {{
-        alert("Nothing to export for the current drill-down selection.");
+      const filtered = drillFilterRows(byMetric);
+      if (!filtered.length) {
+        alert("Nothing to export for the current selection/search.");
         return;
-      }}
+      }
 
       const cols = ["dimension","rule","column","failed_count","failed_pct","sample_values"];
       const lines = [
         cols.join(","),
-        ...filtered.map(r => cols.map(c => {{
-          const v = r[c] ?? "";
+        ...filtered.map(r => cols.map(c => {
+          const v = (c === "sample_values") ? parseSampleValues(r[c]) : (r[c] ?? "");
           const s = String(v).replaceAll('"','""');
-          return `"${{s}}"`;
-        }}).join(","))
+          return `"${s}"`;
+        }).join(","))
       ];
 
-      const blob = new Blob([lines.join("\\n")], {{ type:"text/csv;charset=utf-8" }});
+      const blob = new Blob([lines.join("\n")], { type:"text/csv;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `dq_drilldown_${{metric.label.toLowerCase()}}_${{label.replaceAll(" ","_")}}.csv`;
+      a.download = `dq_drilldown_${metric.label.toLowerCase()}_${label.replaceAll(" ","_")}.csv`;
       a.click();
       URL.revokeObjectURL(url);
-    }});
-    els.btnRun.addEventListener("click", () => alert("This HTML is a report viewer. Run the pipeline in the CLI, then regenerate the report."));
-    els.runSelect.addEventListener("change", () => renderAll(els.runSelect.value));
-  }}
+    });
 
-  function renderAll(label) {{
+    els.runSelect.addEventListener("change", () => renderAll(els.runSelect.value));
+    els.metricSelect.addEventListener("change", () => {
+      activeMetric = els.metricSelect.value;
+      const metric = METRICS.find(m => m.key === activeMetric) || { label:"Overall" };
+      els.activeMetricNote.textContent = "Active: " + metric.label;
+      renderDrill(els.runSelect.value, activeMetric);
+    });
+    els.drillSearch.addEventListener("input", () => renderDrill(els.runSelect.value, activeMetric));
+  }
+
+  function renderAll(label) {
     renderCards(label);
     renderBar(label);
     renderTrend(label);
     renderDrill(label, activeMetric);
-  }}
+  }
 
-  // bootstrap
   buildRunSelect();
+  buildMetricSelect();
   renderTrendChecks();
   renderHistoryTable();
   attachButtons();
+
+  activeMetric = "overall_pct";
+  els.metricSelect.value = activeMetric;
+  els.activeMetricNote.textContent = "Active: Overall";
+
   renderAll(els.runSelect.value);
 </script>
 </body>
@@ -583,15 +722,47 @@ def _build_html(summary_records: list[dict[str, Any]], issues_records: list[dict
 """
 
 
+def _build_html(
+    summary_records: list[dict[str, Any]],
+    issues_records: list[dict[str, Any]],
+    generated: str,
+    dataset_line: str,
+) -> str:
+    metrics_json = [{"key": k, "label": lbl} for k, lbl in METRICS]
+    dims_json = [{"key": k, "label": lbl} for k, lbl in DIMS]
+
+    html = HTML_TEMPLATE
+    html = html.replace("___DQHUB_GENERATED___", html_lib.escape(generated))
+    html = html.replace("___DQHUB_DATASET_LINE___", html_lib.escape(dataset_line))
+    html = html.replace("___DQHUB_XLSX_NAME___", html_lib.escape(XLSX_OUT.name))
+    html = html.replace("___DQHUB_SUMMARY_NAME___", html_lib.escape(SUMMARY_CSV.name))
+    html = html.replace("___DQHUB_ISSUES_NAME___", html_lib.escape(ISSUES_CSV.name))
+
+    html = html.replace("___DQHUB_SUMMARY_JSON___", json.dumps(summary_records, ensure_ascii=False))
+    html = html.replace("___DQHUB_ISSUES_JSON___", json.dumps(issues_records, ensure_ascii=False))
+    html = html.replace("___DQHUB_METRICS_JSON___", json.dumps(metrics_json, ensure_ascii=False))
+    html = html.replace("___DQHUB_DIMS_JSON___", json.dumps(dims_json, ensure_ascii=False))
+    return html
+
+
 def main() -> int:
-    _ensure_report_dirs()
+    _ensure_dirs()
 
     summary = _read_summary()
     issues = _read_issues()
+    issues = _backfill_issue_labels(summary=summary, issues=issues)
 
     _write_excel(summary=summary, issues=issues)
 
-    html = _build_html(summary_records=_to_records(summary), issues_records=_to_records(issues))
+    generated = _now_utc_iso()
+    dataset_line = _dataset_line()
+
+    html = _build_html(
+        summary_records=_to_records(summary),
+        issues_records=_to_records(issues),
+        generated=generated,
+        dataset_line=dataset_line,
+    )
     HTML_OUT.write_text(html, encoding="utf-8")
 
     print(f"Wrote: {XLSX_OUT} | exists: {XLSX_OUT.exists()}")

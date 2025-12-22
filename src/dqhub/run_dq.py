@@ -5,14 +5,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 import json
-import math
 import re
+from shutil import copy2
 
 import pandas as pd
 
 try:
-    import yaml  # type: ignore
-except Exception:  # pragma: no cover
+    import yaml
+except Exception:
     yaml = None
 
 
@@ -32,9 +32,6 @@ LAST_RUN_JSON = REPORTS_DIR / "last_run.json"
 LAST_METRICS_JSON = REPORTS_DIR / "last_metrics.json"
 
 
-# -----------------------------
-# Rules
-# -----------------------------
 @dataclass(frozen=True)
 class Rules:
     version: str = "1.0.0"
@@ -66,8 +63,9 @@ def _load_rules() -> Rules:
         return Rules()
 
     if yaml is None:
-        # Keep it explicit – CI/local must have PyYAML if rules.yaml is present.
-        raise RuntimeError("PyYAML is required because rules/rules.yaml exists, but PyYAML is not installed.")
+        raise RuntimeError(
+            "PyYAML is required because rules/rules.yaml exists, but PyYAML is not installed."
+        )
 
     data = yaml.safe_load(RULES_YAML.read_text(encoding="utf-8")) or {}
     return Rules(
@@ -83,7 +81,6 @@ def _load_rules() -> Rules:
 def _next_run_label(summary_hist: pd.DataFrame) -> str:
     if summary_hist is None or summary_hist.empty:
         return "Run 1"
-    # expected: "Run N"
     last = str(summary_hist["run_label"].iloc[-1]) if "run_label" in summary_hist.columns else ""
     m = re.search(r"(\d+)", last)
     if not m:
@@ -91,60 +88,42 @@ def _next_run_label(summary_hist: pd.DataFrame) -> str:
     return f"Run {int(m.group(1)) + 1}"
 
 
-# -----------------------------
-# JSON-safe helpers (fixes NaT/Timestamp/numpy serialization)
-# -----------------------------
-def _is_nan(x: Any) -> bool:
-    try:
-        return x is None or (isinstance(x, float) and math.isnan(x))
-    except Exception:
-        return False
-
-
 def _to_jsonable(x: Any) -> Any:
-    # Pandas missing datetime
     if x is pd.NaT:
         return None
 
-    # Pandas Timestamp
     if isinstance(x, pd.Timestamp):
         if pd.isna(x):
             return None
         try:
-            # Keep ISO8601, include timezone if present
             return x.isoformat()
         except Exception:
             return str(x)
 
-    # Python datetime
     if isinstance(x, datetime):
         try:
             return x.isoformat()
         except Exception:
             return str(x)
 
-    # Numpy scalars (int64/float64/bool_)
     try:
         import numpy as np  # type: ignore
 
         if isinstance(x, (np.integer,)):
             return int(x)
         if isinstance(x, (np.floating,)):
-            # preserve NaN as None
             return None if np.isnan(x) else float(x)
         if isinstance(x, (np.bool_,)):
             return bool(x)
     except Exception:
         pass
 
-    # Pandas NA
     try:
         if pd.isna(x):
             return None
     except Exception:
         pass
 
-    # Collections
     if isinstance(x, dict):
         return {str(k): _to_jsonable(v) for k, v in x.items()}
     if isinstance(x, (list, tuple, set)):
@@ -157,19 +136,24 @@ def _json_dumps_safe(obj: Any) -> str:
     return json.dumps(_to_jsonable(obj), ensure_ascii=False)
 
 
-# -----------------------------
-# Core logic
-# -----------------------------
 def _read_csv(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"Missing required file: {path}")
-    return pd.read_csv(path)
+    if path.exists():
+        return pd.read_csv(path)
+
+    # If raw.csv is missing but synth exists, copy it for a smoother first-run experience.
+    if path.name == "raw.csv":
+        fallback = path.parents[1] / "synthetic" / "input.csv"
+        if fallback.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            copy2(fallback, path)
+            return pd.read_csv(path)
+
+    raise FileNotFoundError(f"Missing required file: {path}")
 
 
 def _coerce_datetime(df: pd.DataFrame, col: str) -> None:
     if col not in df.columns:
         return
-    # Accept both "...Z" and "+00:00" forms, coerce errors to NaT
     df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
 
 
@@ -180,17 +164,16 @@ def _normalize_strings(df: pd.DataFrame, cols: Iterable[str]) -> None:
 
 
 def _missing_required_mask(df: pd.DataFrame, required_cols: tuple[str, ...]) -> pd.Series:
-    # Missing if column absent OR value is NA OR empty string
     masks: list[pd.Series] = []
     for c in required_cols:
         if c not in df.columns:
-            # if column is missing entirely, everything is missing
             return pd.Series([True] * len(df), index=df.index)
         s = df[c]
         if pd.api.types.is_string_dtype(s) or str(s.dtype).startswith("string"):
             masks.append(s.isna() | (s.astype("string").str.len() == 0))
         else:
             masks.append(s.isna())
+
     out = masks[0].copy()
     for m in masks[1:]:
         out = out | m
@@ -214,13 +197,10 @@ def _issue_row(
 
     failed_pct = round((failed_count / rows) * 100.0, 2)
 
-    # sample values: head(5) from failing rows, JSON-safe
-    sample_vals: list[Any] = []
     try:
         if column in df.columns:
             sample_vals = df.loc[failed_mask, column].head(5).tolist()
         else:
-            # no physical column (e.g., "(required)"), just show blanks
             sample_vals = [""] * min(3, failed_count)
     except Exception:
         sample_vals = []
@@ -233,35 +213,27 @@ def _issue_row(
         "column": column,
         "failed_count": failed_count,
         "failed_pct": failed_pct,
-        "sample_values": _json_dumps_safe(sample_vals),  # FIX: NaT-safe JSON
+        "sample_values": _json_dumps_safe(sample_vals),
     }
 
 
-def main() -> None:
+def main() -> int:
     _ensure_dirs()
     rules = _load_rules()
 
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
     rid = _run_id(now_utc)
 
     df_raw = _read_csv(RAW_CSV)
-
-    # Normalize + parse timestamps
     _normalize_strings(df_raw, [c for c in ["email", "country"] if c in df_raw.columns])
 
-    # Prefer the rules-defined columns if present; else attempt common fallbacks
     order_col = "order_ts_utc" if "order_ts_utc" in df_raw.columns else "order_ts"
     ingest_col = "ingest_ts_utc" if "ingest_ts_utc" in df_raw.columns else "ingest_ts"
 
     _coerce_datetime(df_raw, order_col)
     _coerce_datetime(df_raw, ingest_col)
 
-    # Load history
-    if SUMMARY_CSV.exists():
-        summary_hist = pd.read_csv(SUMMARY_CSV)
-    else:
-        summary_hist = pd.DataFrame()
-
+    summary_hist = pd.read_csv(SUMMARY_CSV) if SUMMARY_CSV.exists() else pd.DataFrame()
     run_label = _next_run_label(summary_hist)
 
     rows_raw = int(df_raw.shape[0])
@@ -270,28 +242,22 @@ def main() -> None:
     missing_required = _missing_required_mask(df_raw, rules.required_columns)
     df_clean = df_raw.loc[~missing_required].copy()
 
-    # If timestamp columns exist, keep them in expected names
+    # normalize expected timestamp column names for downstream consumers
     if order_col != "order_ts_utc" and order_col in df_clean.columns:
         df_clean.rename(columns={order_col: "order_ts_utc"}, inplace=True)
     if ingest_col != "ingest_ts_utc" and ingest_col in df_clean.columns:
         df_clean.rename(columns={ingest_col: "ingest_ts_utc"}, inplace=True)
 
-    # Write clean output
     CLEAN_CSV.parent.mkdir(parents=True, exist_ok=True)
     df_clean.to_csv(CLEAN_CSV, index=False, encoding="utf-8")
     print(f"Clean CSV: {CLEAN_CSV} | exists: {CLEAN_CSV.exists()}")
 
-    rows_after_global_fixes = rows_raw  # kept for compatibility
+    rows_after_global_fixes = rows_raw
     rows_after_hard_clean = int(df_clean.shape[0])
 
-    # -----------------------------
-    # Dimension metrics (computed on raw for full visibility)
-    # -----------------------------
-    # Completeness: required columns present (row-level)
     completeness_bad = missing_required
     completeness_pct = round((1.0 - completeness_bad.mean()) * 100.0, 2) if rows_raw else 0.0
 
-    # Validity: amount min + email regex
     amount_bad = pd.Series([False] * rows_raw, index=df_raw.index)
     if "amount" in df_raw.columns:
         amt = pd.to_numeric(df_raw["amount"], errors="coerce")
@@ -299,101 +265,84 @@ def main() -> None:
 
     email_bad = pd.Series([False] * rows_raw, index=df_raw.index)
     if "email" in df_raw.columns:
-        rx = re.compile(rules.email_regex)
         email_s = df_raw["email"].astype("string")
-        email_bad = email_s.isna() | (email_s.str.len() == 0) | (~email_s.apply(lambda v: bool(rx.match(str(v))) if v is not None else False))
+        email_bad = ~email_s.fillna("").str.match(rules.email_regex)
 
     invalid_any = amount_bad | email_bad
     validity_pct = round((1.0 - invalid_any.mean()) * 100.0, 2) if rows_raw else 0.0
 
-    # Uniqueness: primary key duplicates
     dup_mask = pd.Series([False] * rows_raw, index=df_raw.index)
     if rules.primary_key in df_raw.columns:
         dup_mask = df_raw[rules.primary_key].duplicated(keep=False)
     uniqueness_pct = round((1.0 - dup_mask.mean()) * 100.0, 2) if rows_raw else 0.0
 
-    # Timeliness: delay within max minutes AND timestamps parseable
     time_bad = pd.Series([False] * rows_raw, index=df_raw.index)
     timeliness_pct = 0.0
     if order_col in df_raw.columns and ingest_col in df_raw.columns:
         order_ts = df_raw[order_col]
         ingest_ts = df_raw[ingest_col]
-        # bad if either is NaT
-        time_bad = order_ts.isna() | ingest_ts.isna()
 
-        # compute delay where possible
+        time_bad = order_ts.isna() | ingest_ts.isna()
         delay_min = (ingest_ts - order_ts).dt.total_seconds() / 60.0
         delay_bad = delay_min.isna() | (delay_min < 0) | (delay_min > rules.max_delay_minutes)
         time_bad = time_bad | delay_bad
 
         timeliness_pct = round((1.0 - time_bad.mean()) * 100.0, 2) if rows_raw else 0.0
-    else:
-        timeliness_pct = 0.0
 
-    overall_pct = round((completeness_pct + validity_pct + uniqueness_pct + timeliness_pct) / 4.0, 2)
+    overall_pct = round(
+        (completeness_pct + validity_pct + uniqueness_pct + timeliness_pct) / 4.0, 2
+    )
 
     issues: list[dict[str, Any]] = []
-
-    maybe = _issue_row(
-        run_label=run_label,
-        run_id=rid,
-        df=df_raw,
-        dimension="Completeness",
-        rule="required_columns_present",
-        column="(required)",
-        failed_mask=completeness_bad,
-    )
-    if maybe:
-        issues.append(maybe)
-
-    maybe = _issue_row(
-        run_label=run_label,
-        run_id=rid,
-        df=df_raw,
-        dimension="Validity",
-        rule=f"min_amount:{rules.amount_min}",
-        column="amount",
-        failed_mask=amount_bad,
-    )
-    if maybe:
-        issues.append(maybe)
-
-    maybe = _issue_row(
-        run_label=run_label,
-        run_id=rid,
-        df=df_raw,
-        dimension="Validity",
-        rule="email_format",
-        column="email",
-        failed_mask=email_bad,
-    )
-    if maybe:
-        issues.append(maybe)
-
-    maybe = _issue_row(
-        run_label=run_label,
-        run_id=rid,
-        df=df_raw,
-        dimension="Uniqueness",
-        rule=f"primary_key:{rules.primary_key}",
-        column=rules.primary_key,
-        failed_mask=dup_mask,
-    )
-    if maybe:
-        issues.append(maybe)
-
-    maybe = _issue_row(
-        run_label=run_label,
-        run_id=rid,
-        df=df_raw,
-        dimension="Timeliness",
-        rule=f"max_delay_minutes:{rules.max_delay_minutes}",
-        column="ingest_ts_utc" if "ingest_ts_utc" in df_raw.columns else ingest_col,
-        failed_mask=time_bad,
-    )
-    if maybe:
-        issues.append(maybe)
-
+    for maybe in [
+        _issue_row(
+            run_label=run_label,
+            run_id=rid,
+            df=df_raw,
+            dimension="Completeness",
+            rule="required_columns_present",
+            column="(required)",
+            failed_mask=completeness_bad,
+        ),
+        _issue_row(
+            run_label=run_label,
+            run_id=rid,
+            df=df_raw,
+            dimension="Validity",
+            rule=f"min_amount:{rules.amount_min}",
+            column="amount",
+            failed_mask=amount_bad,
+        ),
+        _issue_row(
+            run_label=run_label,
+            run_id=rid,
+            df=df_raw,
+            dimension="Validity",
+            rule="email_format",
+            column="email",
+            failed_mask=email_bad,
+        ),
+        _issue_row(
+            run_label=run_label,
+            run_id=rid,
+            df=df_raw,
+            dimension="Uniqueness",
+            rule=f"primary_key:{rules.primary_key}",
+            column=rules.primary_key,
+            failed_mask=dup_mask,
+        ),
+        _issue_row(
+            run_label=run_label,
+            run_id=rid,
+            df=df_raw,
+            dimension="Timeliness",
+            rule=f"max_delay_minutes:{rules.max_delay_minutes}",
+            column="ingest_ts_utc" if "ingest_ts_utc" in df_raw.columns else ingest_col,
+            failed_mask=time_bad,
+        ),
+    ]:
+        if maybe:
+            issues.append(maybe)
 
     summary_row = {
         "run_label": run_label,
@@ -415,21 +364,25 @@ def main() -> None:
         hist = pd.read_csv(SUMMARY_CSV)
         summary_out = pd.concat([hist, summary_out], ignore_index=True)
 
-    SUMMARY_CSV.write_text(summary_out.to_csv(index=False), encoding="utf-8")
+    summary_out.to_csv(SUMMARY_CSV, index=False, encoding="utf-8")
 
     issues_out = pd.DataFrame(issues)
     if ISSUES_CSV.exists():
         hist_i = pd.read_csv(ISSUES_CSV)
         issues_out = pd.concat([hist_i, issues_out], ignore_index=True)
 
-    ISSUES_CSV.write_text(issues_out.to_csv(index=False), encoding="utf-8")
+    issues_out.to_csv(ISSUES_CSV, index=False, encoding="utf-8")
 
-    LAST_RUN_JSON.write_text(_json_dumps_safe({"run_label": run_label, "run_id": rid, "run_ts_utc": now_utc.isoformat()}), encoding="utf-8")
+    LAST_RUN_JSON.write_text(
+        _json_dumps_safe({"run_label": run_label, "run_id": rid, "run_ts_utc": now_utc.isoformat()}),
+        encoding="utf-8",
+    )
     LAST_METRICS_JSON.write_text(_json_dumps_safe(summary_row), encoding="utf-8")
 
     print(f"Wrote: {SUMMARY_CSV} | exists: {SUMMARY_CSV.exists()}")
     print(f"Wrote: {ISSUES_CSV} | exists: {ISSUES_CSV.exists()}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
